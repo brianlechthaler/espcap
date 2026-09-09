@@ -132,6 +132,90 @@ impl DeviceConfig {
         Ok(())
     }
 
+    pub fn persist(&self) -> Result<Vec<u8>, Error> {
+        #[derive(Serialize)]
+        struct PersistCfg<'a> {
+            radio: Radio,
+            mode: Mode,
+            format: OutputFormat,
+            wifi_band: WifiBand,
+            dwell_ms: u16,
+            hopmask: u16,
+            channels_5ghz: &'a [u8],
+            ble_interval_ms: u16,
+            ble_window_ms: u16,
+            ble_active: bool,
+            wifi_types: &'a [WifiType],
+            filters: FilterSpec,
+            running: bool,
+        }
+        Ok(serde_json::to_vec(&PersistCfg {
+            radio: self.radio,
+            mode: self.mode,
+            format: self.format,
+            wifi_band: self.wifi_band,
+            dwell_ms: self.dwell_ms,
+            hopmask: self.hopmask,
+            channels_5ghz: &self.channels_5ghz,
+            ble_interval_ms: self.ble_interval_ms,
+            ble_window_ms: self.ble_window_ms,
+            ble_active: self.ble_active,
+            wifi_types: &self.wifi_types,
+            filters: self.filters.to_spec(),
+            running: self.running,
+        })?)
+    }
+
+    pub fn restore(bytes: &[u8]) -> Result<Self, Error> {
+        #[derive(Deserialize)]
+        struct PersistCfg {
+            #[serde(default)]
+            radio: Option<Radio>,
+            #[serde(default)]
+            mode: Option<Mode>,
+            #[serde(default)]
+            format: Option<OutputFormat>,
+            #[serde(default)]
+            wifi_band: Option<WifiBand>,
+            #[serde(default)]
+            dwell_ms: Option<u16>,
+            #[serde(default)]
+            hopmask: Option<u16>,
+            #[serde(default)]
+            channels_5ghz: Option<Vec<u8>>,
+            #[serde(default)]
+            ble_interval_ms: Option<u16>,
+            #[serde(default)]
+            ble_window_ms: Option<u16>,
+            #[serde(default)]
+            ble_active: Option<bool>,
+            #[serde(default)]
+            wifi_types: Option<Vec<WifiType>>,
+            #[serde(default)]
+            filters: Option<FilterSpec>,
+            #[serde(default)]
+            running: bool,
+        }
+        let p: PersistCfg = serde_json::from_slice(bytes)?;
+        let mut cfg = Self::default();
+        cfg.apply_set(
+            p.radio,
+            p.mode,
+            p.format,
+            p.wifi_band,
+            p.dwell_ms,
+            p.hopmask,
+            p.channels_5ghz,
+            p.ble_interval_ms,
+            p.ble_window_ms,
+            p.ble_active,
+            p.wifi_types,
+            p.filters,
+        )?;
+        cfg.running = p.running;
+        Ok(cfg)
+    }
+
     pub fn promiscuous_filter_mask(&self) -> u32 {
         let mut mask = 0u32;
         for t in &self.wifi_types {
@@ -279,5 +363,35 @@ mod tests {
         assert_eq!(status["wifi_bands"][0], "2.4");
         let status = cfg.status_json(Chip::Esp32c5, &DropCounters::default());
         assert_eq!(status["wifi_bands"][1], "5");
+    }
+
+    #[test]
+    fn persist_roundtrip_and_bad_blob() {
+        let mut cfg = DeviceConfig::default();
+        apply_cmd(
+            &mut cfg,
+            r#"{"cmd":"set","radio":"wifi","mode":"capture","format":"pcap","wifi_band":"2.4","dwell_ms":400,"hopmask":"0x0002","channels_5ghz":[36],"ble_interval_ms":80,"ble_window_ms":40,"wifi_types":["mgmt"],"ble_active":true,"filters":{"oui":["F4:4E:FC"],"ssid_regex":"^x"}}"#,
+        )
+        .unwrap();
+        cfg.running = true;
+        let blob = cfg.persist().unwrap();
+        let got = DeviceConfig::restore(&blob).unwrap();
+        assert_eq!(got.radio, Radio::Wifi);
+        assert_eq!(got.mode, Mode::Capture);
+        assert_eq!(got.format, OutputFormat::Pcap);
+        assert_eq!(got.wifi_band, WifiBand::TwoG);
+        assert_eq!(got.dwell_ms, 400);
+        assert_eq!(got.hopmask, 0x0002);
+        assert_eq!(got.channels_5ghz, vec![36]);
+        assert_eq!(got.ble_interval_ms, 80);
+        assert_eq!(got.ble_window_ms, 40);
+        assert!(got.ble_active);
+        assert!(got.running);
+        assert_eq!(got.filters, cfg.filters);
+        assert!(DeviceConfig::restore(b"not-json").is_err());
+        assert!(DeviceConfig::restore(br#"{"dwell_ms":1}"#).is_err());
+        let empty = DeviceConfig::restore(b"{}").unwrap();
+        assert_eq!(empty.radio, Radio::Off);
+        assert!(!empty.running);
     }
 }

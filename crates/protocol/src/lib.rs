@@ -32,6 +32,7 @@ mod tests {
         let _ = Radio::Both;
         let _ = parse_line(r#"{"cmd":"get"}"#).unwrap();
         let _ = DeviceConfig::default();
+        let _ = DeviceConfig::default().persist().unwrap();
         let _ = FilterSpec::default();
         let _ = DEFAULT_HOPMASK;
         let _ = DEFAULT_CHANNELS_5GHZ;

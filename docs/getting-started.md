@@ -32,7 +32,7 @@ make firmware-s3
 make flash-s3
 ```
 
-`flash-s3` writes USB Serial/JTAG on `/dev/ttyACM0`. After reset, the device speaks JSON lines at 115200 8N1. On Linux, opening the port can pulse DTR and reset the chip; `espcap` waits for a `status` event (up to 15s) before sending commands.
+`flash-s3` writes USB Serial/JTAG on `/dev/ttyACM0`. After reset, the device speaks JSON lines at 115200 8N1. `espcap` deasserts RTS then DTR so Linux CDC-ACM does not reset the S3, then waits for a `status` event (up to 15s) before sending commands.
 
 ## First capture
 

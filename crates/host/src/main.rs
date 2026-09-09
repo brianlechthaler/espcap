@@ -13,15 +13,22 @@ use std::path::Path;
 use std::time::Duration;
 
 fn open_serial(port: &str, baud: u32) -> Result<Box<dyn serialport::SerialPort>, Error> {
+    use serialport::SerialPort;
     let builder = serialport::new(port, baud)
         .timeout(Duration::from_millis(400))
-        .dtr_on_open(false);
+        .preserve_dtr_on_open();
+    #[cfg(unix)]
+    let mut p = builder
+        .open_native()
+        .map_err(|e| Error::Serial(e.to_string()))?;
+    #[cfg(not(unix))]
+    let mut p = builder.open().map_err(|e| Error::Serial(e.to_string()))?;
+    // ESP32 USB-JTAG: RTS=1 DTR=0 resets. Match serial-capture: RTS then DTR, both off.
+    let _ = p.write_request_to_send(false);
+    let _ = p.write_data_terminal_ready(false);
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        let p = builder
-            .open_native()
-            .map_err(|e| Error::Serial(e.to_string()))?;
         unsafe {
             let fd = p.as_raw_fd();
             let mut ios: libc::termios = std::mem::zeroed();
@@ -30,18 +37,8 @@ fn open_serial(port: &str, baud: u32) -> Result<Box<dyn serialport::SerialPort>,
                 let _ = libc::tcsetattr(fd, libc::TCSANOW, &ios);
             }
         }
-        Ok(Box::new(p))
     }
-    #[cfg(not(unix))]
-    {
-        use serialport::SerialPort;
-        use std::io::Write;
-        let mut p = builder.open().map_err(|e| Error::Serial(e.to_string()))?;
-        let _ = p.write_data_terminal_ready(false);
-        let _ = p.write_all(b"\n");
-        let _ = p.flush();
-        Ok(p)
-    }
+    Ok(Box::new(p))
 }
 
 fn consume_unread<R: std::io::Read>(reader: &mut BufReader<R>) {

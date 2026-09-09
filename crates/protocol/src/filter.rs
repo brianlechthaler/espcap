@@ -1,4 +1,4 @@
-use crate::mac::{oui_of, parse_mac, parse_oui};
+use crate::mac::{format_mac, format_oui, oui_of, parse_mac, parse_oui};
 use crate::Error;
 use regex_lite::Regex;
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,16 @@ impl FilterEngine {
             ssid_regex,
             company_ids: spec.company_id.clone(),
         })
+    }
+
+    pub fn to_spec(&self) -> FilterSpec {
+        FilterSpec {
+            oui: self.ouis.iter().map(format_oui).collect(),
+            mac: self.macs.iter().map(format_mac).collect(),
+            name_regex: self.name_regex.as_ref().map(|r| r.as_str().to_string()),
+            ssid_regex: self.ssid_regex.as_ref().map(|r| r.as_str().to_string()),
+            company_id: self.company_ids.clone(),
+        }
     }
 
     pub fn is_open(&self) -> bool {
@@ -127,6 +137,7 @@ mod tests {
     fn empty_passes_everything() {
         let f = FilterEngine::default();
         assert!(f.is_open());
+        assert_eq!(f.to_spec(), FilterSpec::default());
         assert!(f.matches_wifi(&[1, 2, 3, 4, 5, 6], Some("x")));
         assert!(f.matches_ble(&[1, 2, 3, 4, 5, 6], None, None));
     }
@@ -142,6 +153,7 @@ mod tests {
         };
         let f = FilterEngine::from_spec(&spec).unwrap();
         assert!(!f.is_open());
+        assert_eq!(FilterEngine::from_spec(&f.to_spec()).unwrap(), f);
         let apple = [0xf4, 0x4e, 0xfc, 0, 0, 1];
         assert!(f.matches_wifi(&apple, Some("FlockCam")));
         assert!(!f.matches_wifi(&apple, Some("other")));
@@ -207,5 +219,7 @@ mod tests {
         .unwrap()
         .name_regex
         .is_none());
+        let round = FilterEngine::from_spec(&spec).unwrap();
+        assert_eq!(FilterEngine::from_spec(&round.to_spec()).unwrap(), round);
     }
 }

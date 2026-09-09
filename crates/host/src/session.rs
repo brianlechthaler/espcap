@@ -7,6 +7,10 @@ fn is_timeout(e: &Error) -> bool {
     matches!(e, Error::Io(err) if err.kind() == io::ErrorKind::TimedOut)
 }
 
+fn skip_line(e: &Error) -> bool {
+    is_timeout(e) || matches!(e, Error::Msg(m) if m.starts_with("parse "))
+}
+
 pub fn write_command(w: &mut impl Write, cmd: &Command) -> Result<(), Error> {
     let line = encode_line(cmd)?;
     log::debug!("tx {line}");
@@ -53,7 +57,7 @@ pub fn read_status_for(r: &mut impl BufRead, timeout: Duration) -> Result<Event,
             Ok(Event::Status(v)) => return Ok(Event::Status(v)),
             Ok(Event::Error { msg }) => return Err(Error::msg(msg)),
             Ok(_) => {}
-            Err(e) if is_timeout(&e) => {}
+            Err(e) if skip_line(&e) => {}
             Err(e) => return Err(e),
         }
     }
@@ -73,7 +77,7 @@ pub fn wait_ack_for(r: &mut impl BufRead, timeout: Duration) -> Result<(), Error
             Ok(Event::Ack) => return Ok(()),
             Ok(Event::Error { msg }) => return Err(Error::msg(msg)),
             Ok(_) => {}
-            Err(e) if is_timeout(&e) => {}
+            Err(e) if skip_line(&e) => {}
             Err(e) => return Err(e),
         }
     }
@@ -179,6 +183,19 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("parse "));
+        wait_ack(&mut Cursor::new(
+            b"{not-json\n{\"event\":\"ack\"}\n".to_vec(),
+        ))
+        .unwrap();
+        let mut glued = b"}{\"event\":\"wifi_ap\"\n".to_vec();
+        glued.extend_from_slice(b"{\"event\":\"ack\"}\n");
+        wait_ack(&mut Cursor::new(glued)).unwrap();
+        let mut st_bad = b"{truncated\n".to_vec();
+        st_bad.extend_from_slice(b"{\"event\":\"status\",\"chip\":\"esp32s3\"}\n");
+        assert!(matches!(
+            read_status(&mut Cursor::new(st_bad)).unwrap(),
+            Event::Status(_)
+        ));
         assert!(read_status(&mut Cursor::new(wifi.to_vec())).is_err());
         assert!(read_status(&mut Cursor::new(
             b"{\"event\":\"error\",\"msg\":\"no\"}\n".to_vec()

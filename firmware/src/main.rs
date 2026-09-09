@@ -1,7 +1,7 @@
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_svc::sys::{
     esp_task_wdt_reset, esp_timer_get_time, esp_wifi_set_channel, esp_wifi_set_promiscuous,
     esp_wifi_set_promiscuous_filter, esp_wifi_set_promiscuous_rx_cb, wifi_promiscuous_filter_t,
@@ -115,20 +115,55 @@ fn emit(line: &str) {
 
 fn emit_bytes(bytes: &[u8]) {
     let mut off = 0usize;
-    for _ in 0..40 {
-        let n = unsafe { usb_serial_jtag_write_bytes(bytes[off..].as_ptr(), bytes.len() - off, 2) };
+    for _ in 0..200 {
+        let n =
+            unsafe { usb_serial_jtag_write_bytes(bytes[off..].as_ptr(), bytes.len() - off, 20) };
         if n > 0 {
             off += n as usize;
             if off >= bytes.len() {
                 unsafe {
-                    let _ = usb_serial_jtag_wait_tx_done(20);
+                    let _ = usb_serial_jtag_wait_tx_done(40);
                 }
                 return;
             }
+        } else {
+            unsafe {
+                let _ = usb_serial_jtag_wait_tx_done(20);
+            }
+            FreeRtos::delay_ms(2);
         }
-        FreeRtos::delay_ms(2);
+    }
+    if off > 0 && bytes.get(off.saturating_sub(1)) != Some(&b'\n') {
+        let nl = [b'\n'];
+        unsafe {
+            let _ = usb_serial_jtag_write_bytes(nl.as_ptr(), 1, 20);
+            let _ = usb_serial_jtag_wait_tx_done(20);
+        }
     }
     DROP_CDC.fetch_add(1, Ordering::Relaxed);
+}
+
+fn load_cfg(nvs: &Option<EspNvs<NvsDefault>>) -> DeviceConfig {
+    let Some(nvs) = nvs else {
+        return DeviceConfig::default();
+    };
+    let Ok(Some(len)) = nvs.blob_len("cfg") else {
+        return DeviceConfig::default();
+    };
+    let mut buf = vec![0u8; len.min(4096)];
+    match nvs.get_blob("cfg", &mut buf) {
+        Ok(Some(bytes)) => DeviceConfig::restore(bytes).unwrap_or_default(),
+        _ => DeviceConfig::default(),
+    }
+}
+
+fn save_cfg(nvs: &Option<EspNvs<NvsDefault>>, cfg: &DeviceConfig) {
+    let Some(nvs) = nvs else {
+        return;
+    };
+    if let Ok(blob) = cfg.persist() {
+        let _ = nvs.set_blob("cfg", &blob);
+    }
 }
 
 fn reply_status(cfg: &DeviceConfig) {
@@ -173,9 +208,12 @@ unsafe extern "C" fn wifi_rx_cb(buf: *mut core::ffi::c_void, _typ: u32) {
     }
 }
 
-fn apply_command(cfg: &mut DeviceConfig, line: &str) {
+fn apply_command(cfg: &mut DeviceConfig, line: &str) -> bool {
     match parse_line(line) {
-        Ok(Command::Get) | Ok(Command::Status) => reply_status(cfg),
+        Ok(Command::Get) | Ok(Command::Status) => {
+            reply_status(cfg);
+            false
+        }
         Ok(Command::Start) => {
             cfg.running = true;
             emit(&encode_event(&ack()).unwrap_or_else(|_| "{\"event\":\"ack\"}".into()));
@@ -193,10 +231,12 @@ fn apply_command(cfg: &mut DeviceConfig, line: &str) {
                     ));
                 }
             }
+            true
         }
         Ok(Command::Stop) => {
             cfg.running = false;
             emit(&encode_event(&ack()).unwrap_or_else(|_| "{\"event\":\"ack\"}".into()));
+            true
         }
         Ok(Command::Set {
             radio,
@@ -231,23 +271,34 @@ fn apply_command(cfg: &mut DeviceConfig, line: &str) {
                         emit(
                             &encode_event(&ack()).unwrap_or_else(|_| "{\"event\":\"ack\"}".into()),
                         );
+                        true
                     }
-                    Err(e) => emit(
+                    Err(e) => {
+                        emit(
+                            &encode_event(&error_event(e.to_string())).unwrap_or_else(|_| {
+                                "{\"event\":\"error\",\"msg\":\"encode\"}".into()
+                            }),
+                        );
+                        false
+                    }
+                },
+                Err(e) => {
+                    emit(
                         &encode_event(&error_event(e.to_string()))
                             .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()),
-                    ),
-                },
-                Err(e) => emit(
-                    &encode_event(&error_event(e.to_string()))
-                        .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()),
-                ),
+                    );
+                    false
+                }
             }
         }
-        Err(espcap_protocol::Error::UnknownCommand) => {}
-        Err(e) => emit(
-            &encode_event(&error_event(e.to_string()))
-                .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()),
-        ),
+        Err(espcap_protocol::Error::UnknownCommand) => false,
+        Err(e) => {
+            emit(
+                &encode_event(&error_event(e.to_string()))
+                    .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()),
+            );
+            false
+        }
     }
 }
 
@@ -453,6 +504,7 @@ fn main() -> Result<(), EspError> {
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
+    let store = EspNvs::new(nvs.clone(), "espcap", true).ok();
     let mut wifi = EspWifi::new(peripherals.modem, sysloop, Some(nvs))?;
     wifi.set_configuration(&Configuration::Client(ClientConfiguration {
         ..Default::default()
@@ -467,7 +519,7 @@ fn main() -> Result<(), EspError> {
         let _ = esp_wifi_set_promiscuous_rx_cb(Some(wifi_rx_cb));
     }
 
-    let cfg = Arc::new(Mutex::new(DeviceConfig::default()));
+    let cfg = Arc::new(Mutex::new(load_cfg(&store)));
     let running = Arc::new(AtomicBool::new(true));
     {
         #[cfg(target_arch = "xtensa")]
@@ -495,9 +547,12 @@ fn main() -> Result<(), EspError> {
     let mut ble_dedup: HashMap<[u8; 6], Dedup> = HashMap::new();
     let mut acc = Vec::new();
     let mut tmp = [0u8; 256];
-    let mut last_mask = 0u32;
+    let mut last_mask;
     {
         let g = cfg.lock().unwrap();
+        last_mask = g.promiscuous_filter_mask();
+        set_promisc_filter(last_mask);
+        apply_radios(&g);
         reply_status(&g);
     }
     loop {
@@ -515,7 +570,9 @@ fn main() -> Result<(), EspError> {
                     continue;
                 }
                 let mut g = cfg.lock().unwrap();
-                apply_command(&mut g, line);
+                if apply_command(&mut g, line) {
+                    save_cfg(&store, &g);
+                }
                 let mask = g.promiscuous_filter_mask();
                 if mask != last_mask {
                     last_mask = mask;

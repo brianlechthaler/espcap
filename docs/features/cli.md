@@ -11,7 +11,7 @@ espcap --port /dev/ttyACM0 start --pcap capture
 espcap --port /dev/ttyACM0 stop
 ```
 
-`--port` is required. Default baud is 115200. Typical device node is `/dev/ttyACM*`. Opening the port may reset USB-JTAG; the CLI waits for a `status` JSON before sending commands and does not leave DTR asserted.
+`--port` is required. Default baud is 115200. Typical device node is `/dev/ttyACM*`. The CLI deasserts RTS then DTR on open (same as serial-capture) so ESP32 USB-JTAG does not reset (`RTS=1 DTR=0` is a chip reset). It waits for a `status` JSON before sending commands. Firmware stores radio/mode/`running` in NVS, so a later `status` in another process still sees the live config.
 
 `start` holds the port and streams JSONL as lines arrive (stdout if `--json -`). For [serial-capture](https://github.com/brianlechthaler/serial_capture), configure and detach in one process so the port is free:
 

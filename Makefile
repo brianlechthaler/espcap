@@ -23,4 +23,4 @@ firmware-c5:
 	cd firmware && MCU=esp32c5 IDF_MAINTAINER=1 $(ESP32_WITH_ENV) cargo build --release --target riscv32imac-esp-espidf
 
 flash-s3:
-	cd firmware && MCU=esp32s3 IDF_MAINTAINER=1 $(ESP32_WITH_ENV) cargo espflash flash --release --target xtensa-esp32s3-espidf --port /dev/ttyACM0
+	cd firmware && MCU=esp32s3 IDF_MAINTAINER=1 $(ESP32_WITH_ENV) cargo espflash flash --release --target xtensa-esp32s3-espidf --port /dev/ttyACM0 --partition-table partitions.csv --flash-size 8mb
