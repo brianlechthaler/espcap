@@ -50,17 +50,22 @@ pub fn parse_line(line: &str) -> Result<Command, Error> {
     if line.is_empty() {
         return Err(Error::UnknownCommand);
     }
-    let v: serde_json::Value = serde_json::from_str(line)?;
-    let cmd = v
-        .get("cmd")
-        .and_then(|c| c.as_str())
-        .ok_or(Error::UnknownCommand)?;
-    match cmd {
-        "get" | "start" | "stop" | "status" | "set" => {
-            serde_json::from_value(v).map_err(Into::into)
-        }
-        _ => Err(Error::UnknownCommand),
+    let stream = serde_json::Deserializer::from_str(line).into_iter::<serde_json::Value>();
+    let mut last = Error::UnknownCommand;
+    for item in stream {
+        let v = item?;
+        let Some(cmd) = v.get("cmd").and_then(|c| c.as_str()) else {
+            last = Error::UnknownCommand;
+            continue;
+        };
+        return match cmd {
+            "get" | "start" | "stop" | "status" | "set" => {
+                serde_json::from_value(v).map_err(Into::into)
+            }
+            _ => Err(Error::UnknownCommand),
+        };
     }
+    Err(last)
 }
 
 pub fn encode_line(cmd: &Command) -> Result<String, Error> {
@@ -82,6 +87,10 @@ mod tests {
         assert!(parse_line("{\"cmd\":\"nope\"}").is_err());
         assert!(parse_line("{").is_err());
         assert!(parse_line("{}").is_err());
+        assert!(matches!(
+            parse_line("{\"event\":\"ack\"}{\"cmd\":\"status\"}").unwrap(),
+            Command::Status
+        ));
     }
 
     #[test]

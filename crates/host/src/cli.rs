@@ -51,12 +51,16 @@ pub enum Cmd {
         manufacturer_regex: Option<String>,
         #[arg(long, value_delimiter = ',')]
         company_id: Option<Vec<u16>>,
+        #[arg(long)]
+        start: bool,
     },
     Start {
-        #[arg(long, conflicts_with = "pcap")]
+        #[arg(long, conflicts_with = "pcap", conflicts_with = "detach")]
         json: Option<String>,
-        #[arg(long, conflicts_with = "json")]
+        #[arg(long, conflicts_with = "json", conflicts_with = "detach")]
         pcap: Option<String>,
+        #[arg(long, conflicts_with_all = ["json", "pcap"])]
+        detach: bool,
     },
 }
 
@@ -209,6 +213,10 @@ mod tests {
         assert!(matches!(cli.cmd, Cmd::Start { json: Some(_), .. }));
         let cli = Cli::parse_from(["espcap", "--port", "x", "start", "--pcap", "cap"]);
         assert!(matches!(cli.cmd, Cmd::Start { pcap: Some(_), .. }));
+        let cli = Cli::parse_from(["espcap", "--port", "x", "start", "--detach"]);
+        assert!(matches!(cli.cmd, Cmd::Start { detach: true, .. }));
+        let cli = Cli::parse_from(["espcap", "--port", "x", "set", "--radio", "wifi", "--start"]);
+        assert!(matches!(cli.cmd, Cmd::Set { start: true, .. }));
         let cli = Cli::parse_from(["espcap", "--port", "x", "stop"]);
         assert!(matches!(cli.cmd, Cmd::Stop));
         let cmd = set_command(

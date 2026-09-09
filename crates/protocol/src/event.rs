@@ -79,7 +79,12 @@ pub fn parse_event_line(line: &str) -> Result<Event, Error> {
     if line.is_empty() {
         return Err(Error::UnknownEvent);
     }
-    let v: serde_json::Value = serde_json::from_str(line)?;
+    let mut stream = serde_json::Deserializer::from_str(line).into_iter::<serde_json::Value>();
+    let v = match stream.next() {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => return Err(Error::Json(format!("stream {e}"))),
+        None => return Err(Error::UnknownEvent),
+    };
     let ev = v
         .get("event")
         .and_then(|e| e.as_str())
@@ -262,7 +267,15 @@ mod tests {
         assert!(parse_event_line("{}").is_err());
         assert!(parse_event_line("{\"event\":\"nope\"}").is_err());
         assert!(parse_event_line("{").is_err());
+        assert!(parse_event_line("{")
+            .unwrap_err()
+            .to_string()
+            .contains("stream"));
         assert!(parse_event_line("{\"event\":\"ack\",\"extra\":1}").is_ok());
         assert!(parse_event_line("{\"event\":\"ack\"}").is_ok());
+        assert!(matches!(
+            parse_event_line("{\"event\":\"ack\"}{\"event\":\"wifi_ap\"}"),
+            Ok(Event::Ack)
+        ));
     }
 }

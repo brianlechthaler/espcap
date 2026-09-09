@@ -102,13 +102,19 @@ impl PcapSinks {
 }
 
 pub fn capture_json_from(r: &mut impl BufRead, path: &str) -> Result<(), Error> {
-    let mut lines = Vec::new();
+    let mut out: Box<dyn Write> = if path == "-" {
+        Box::new(io::stdout().lock())
+    } else {
+        Box::new(File::create(path)?)
+    };
     let mut buf = String::new();
     loop {
         buf.clear();
-        let n = r.read_line(&mut buf)?;
-        if n == 0 {
-            break;
+        match r.read_line(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+            Err(e) => return Err(e.into()),
         }
         let trimmed = buf.trim();
         if trimmed.is_empty() {
@@ -118,10 +124,11 @@ pub fn capture_json_from(r: &mut impl BufRead, path: &str) -> Result<(), Error> 
             continue;
         };
         if parse_event_line(json).is_ok() {
-            lines.push(json.to_string());
+            writeln!(out, "{json}")?;
+            out.flush()?;
         }
     }
-    write_jsonl(path, lines.into_iter())
+    Ok(())
 }
 
 pub fn capture_pcap_from(r: &mut impl Read, prefix: &Path) -> Result<(), Error> {
@@ -155,7 +162,7 @@ mod tests {
     use espcap_protocol::wifi::beacon_fixture;
     use espcap_protocol::{parse_event_line, WifiBand};
     use std::fs;
-    use std::io::{self, Cursor, Read, Write};
+    use std::io::{self, BufReader, Cursor, Read, Write};
     use std::path::Path;
 
     #[test]
@@ -213,8 +220,53 @@ mod tests {
 
         let mut json_in = Cursor::new(b"\nI (1) boot size{\"event\":\"ack\"}\n{\"incomplete\"");
         capture_json_from(&mut json_in, json_path.to_str().unwrap()).unwrap();
+        let mut json_in = Cursor::new(b"\nnojson\n{\"event\":\"ack\"}\n");
+        capture_json_from(&mut json_in, json_path.to_str().unwrap()).unwrap();
         let mut json_in = Cursor::new(b"\n{\"event\":\"ack\"}\n");
         capture_json_from(&mut json_in, json_path.to_str().unwrap()).unwrap();
+        let streamed = dir.join("stream.jsonl");
+        struct MidWrite {
+            stage: u8,
+            path: std::path::PathBuf,
+        }
+        impl Read for MidWrite {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                match self.stage {
+                    0 => {
+                        self.stage = 1;
+                        let line = b"{\"event\":\"ack\"}\n";
+                        buf[..line.len()].copy_from_slice(line);
+                        Ok(line.len())
+                    }
+                    1 => {
+                        let got = fs::read_to_string(&self.path).unwrap_or_default();
+                        assert!(got.contains("ack"), "json capture must flush before EOF");
+                        self.stage = 2;
+                        Err(io::Error::new(io::ErrorKind::TimedOut, "t"))
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+        let mut mid = BufReader::new(MidWrite {
+            stage: 0,
+            path: streamed.clone(),
+        });
+        capture_json_from(&mut mid, streamed.to_str().unwrap()).unwrap();
+        assert!(fs::read_to_string(&streamed).unwrap().contains("ack"));
+        capture_json_from(&mut Cursor::new(b"{\"event\":\"ack\"}\n"), "-").unwrap();
+        assert!(capture_json_from(
+            &mut Cursor::new(b"{\"event\":\"ack\"}\n"),
+            "/no/such/espcap-dir/x.jsonl",
+        )
+        .is_err());
+        struct BoomR;
+        impl Read for BoomR {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("boom"))
+            }
+        }
+        assert!(capture_json_from(&mut BufReader::new(BoomR), streamed.to_str().unwrap()).is_err());
         write_jsonl("-", ["{\"event\":\"ack\"}".into()].into_iter()).unwrap();
 
         let mut pcap_in = Cursor::new(framed);

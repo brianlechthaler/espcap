@@ -9,7 +9,9 @@ pub use io_util::{
     PcapSinks,
 };
 pub use oui::{builtin_oui_db, merge_filters, ouis_for_manufacturer, OuiEntry};
-pub use session::{read_event, read_status, request_status, wait_ack, write_command};
+pub use session::{
+    read_event, read_status, request_status, wait_ack, wait_ack_for, wait_ready, write_command,
+};
 
 use espcap_protocol::Error as ProtoError;
 use std::io;

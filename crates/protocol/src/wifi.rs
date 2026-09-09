@@ -109,7 +109,17 @@ fn extract_ssid(mpdu: &[u8], ie_off: usize) -> Option<String> {
             return None;
         }
         if tag == 0 {
-            return Some(String::from_utf8_lossy(&mpdu[i..i + len]).into_owned());
+            let raw = &mpdu[i..i + len];
+            let n = raw
+                .iter()
+                .rposition(|&b| b != 0)
+                .map(|j| j + 1)
+                .unwrap_or(0);
+            let s: String = String::from_utf8_lossy(&raw[..n])
+                .chars()
+                .filter(|c| *c != '\u{FFFD}' && !c.is_control())
+                .collect();
+            return Some(s);
         }
         i += len;
     }
@@ -230,5 +240,19 @@ mod tests {
             .unwrap()
             .ssid
             .is_none());
+    }
+
+    #[test]
+    fn ssid_strips_trailing_nuls_and_invalid_bytes() {
+        let bssid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let padded = beacon_fixture(bssid, &(String::from("Flock") + "\0\0\0"));
+        assert_eq!(parse_80211(&padded).unwrap().ssid.as_deref(), Some("Flock"));
+        let hidden = beacon_fixture(bssid, &"\0".repeat(32));
+        assert_eq!(parse_80211(&hidden).unwrap().ssid.as_deref(), Some(""));
+        let mut junk = beacon_fixture(bssid, "ab");
+        let ie = junk.len() - 2;
+        junk[ie] = 0xff;
+        junk[ie + 1] = 0xfe;
+        assert_eq!(parse_80211(&junk).unwrap().ssid.as_deref(), Some(""));
     }
 }

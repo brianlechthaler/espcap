@@ -1,16 +1,13 @@
 use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys::{
-    ble_gap_disc, ble_gap_disc_params, ble_gap_event, ble_hs_cfg, esp_timer_get_time,
-    esp_wifi_set_channel, esp_wifi_set_promiscuous, esp_wifi_set_promiscuous_filter,
-    esp_wifi_set_promiscuous_rx_cb, nimble_port_freertos_deinit, nimble_port_freertos_init,
-    nimble_port_init, nimble_port_run, wifi_promiscuous_filter_t, wifi_promiscuous_pkt_t,
-    wifi_second_chan_t_WIFI_SECOND_CHAN_NONE, EspError, BLE_ADDR_PUBLIC, BLE_GAP_EVENT_DISC,
-    BLE_GAP_EVENT_DISC_COMPLETE, BLE_GAP_EVENT_EXT_DISC,
+    esp_task_wdt_reset, esp_timer_get_time, esp_wifi_set_channel, esp_wifi_set_promiscuous,
+    esp_wifi_set_promiscuous_filter, esp_wifi_set_promiscuous_rx_cb, wifi_promiscuous_filter_t,
+    wifi_promiscuous_pkt_t, wifi_second_chan_t_WIFI_SECOND_CHAN_NONE, EspError,
 };
 use esp_idf_svc::wifi::{ClientConfiguration, Configuration, EspWifi};
-use espcap_protocol::ble::parse_adv;
 use espcap_protocol::config::DropCounters;
 use espcap_protocol::pcap::{
     ble_pcap_payload, encode_frame, pcap_global_header, wifi_pcap_payload,
@@ -23,12 +20,10 @@ use espcap_protocol::{
     Command, DeviceConfig,
 };
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
 
 const SNAP_COPY: usize = 768;
 const DEDUP_COOLDOWN_MS: u64 = 5000;
@@ -63,14 +58,41 @@ struct Dedup {
     last_emit: u64,
 }
 
-static WIFI_TX: Mutex<Option<SyncSender<WifiPkt>>> = Mutex::new(None);
-static BLE_TX: Mutex<Option<SyncSender<BlePkt>>> = Mutex::new(None);
-static APP_CFG: Mutex<Option<Arc<Mutex<DeviceConfig>>>> = Mutex::new(None);
-static DROPS: Mutex<DropCounters> = Mutex::new(DropCounters {
-    ring_overflow: 0,
-    cdc_backpressure: 0,
-    truncated: 0,
-});
+static WIFI_TX: OnceLock<SyncSender<WifiPkt>> = OnceLock::new();
+static WIFI_ON: AtomicBool = AtomicBool::new(false);
+static DROP_RING: AtomicU32 = AtomicU32::new(0);
+static DROP_CDC: AtomicU32 = AtomicU32::new(0);
+static DROP_TRUNC: AtomicU32 = AtomicU32::new(0);
+
+#[repr(C)]
+struct UsjCfg {
+    tx_buffer_size: u32,
+    rx_buffer_size: u32,
+}
+
+unsafe extern "C" {
+    fn usb_serial_jtag_driver_install(cfg: *mut UsjCfg) -> i32;
+    fn usb_serial_jtag_is_driver_installed() -> bool;
+    fn usb_serial_jtag_read_bytes(buf: *mut u8, length: u32, ticks_to_wait: u32) -> i32;
+    fn usb_serial_jtag_write_bytes(src: *const u8, size: usize, ticks_to_wait: u32) -> i32;
+    fn usb_serial_jtag_wait_tx_done(ticks_to_wait: u32) -> i32;
+    fn usb_serial_jtag_vfs_use_driver();
+}
+
+fn usj_install() {
+    if unsafe { usb_serial_jtag_is_driver_installed() } {
+        unsafe { usb_serial_jtag_vfs_use_driver() };
+        return;
+    }
+    let mut cfg = UsjCfg {
+        tx_buffer_size: 1024,
+        rx_buffer_size: 1024,
+    };
+    unsafe {
+        let _ = usb_serial_jtag_driver_install(&mut cfg);
+        usb_serial_jtag_vfs_use_driver();
+    }
+}
 
 fn chip() -> Chip {
     if cfg!(target_arch = "xtensa") {
@@ -85,30 +107,43 @@ fn now_ms() -> u64 {
 }
 
 fn emit(line: &str) {
-    let mut out = io::stdout();
-    let _ = writeln!(out, "{line}");
-    let _ = out.flush();
+    let mut buf = Vec::with_capacity(line.len() + 1);
+    buf.extend_from_slice(line.as_bytes());
+    buf.push(b'\n');
+    emit_bytes(&buf);
 }
 
 fn emit_bytes(bytes: &[u8]) {
-    let mut out = io::stdout();
-    if out.write_all(bytes).is_err() {
-        if let Ok(mut d) = DROPS.lock() {
-            d.cdc_backpressure = d.cdc_backpressure.saturating_add(1);
+    let mut off = 0usize;
+    for _ in 0..40 {
+        let n = unsafe { usb_serial_jtag_write_bytes(bytes[off..].as_ptr(), bytes.len() - off, 2) };
+        if n > 0 {
+            off += n as usize;
+            if off >= bytes.len() {
+                unsafe {
+                    let _ = usb_serial_jtag_wait_tx_done(20);
+                }
+                return;
+            }
         }
+        FreeRtos::delay_ms(2);
     }
-    let _ = out.flush();
+    DROP_CDC.fetch_add(1, Ordering::Relaxed);
 }
 
 fn reply_status(cfg: &DeviceConfig) {
-    let drops = DROPS.lock().ok().map(|d| d.clone()).unwrap_or_default();
+    let drops = DropCounters {
+        ring_overflow: DROP_RING.load(Ordering::Relaxed),
+        cdc_backpressure: DROP_CDC.load(Ordering::Relaxed),
+        truncated: DROP_TRUNC.load(Ordering::Relaxed),
+    };
     if let Ok(s) = serde_json::to_string(&cfg.status_json(chip(), &drops)) {
         emit(&s);
     }
 }
 
 unsafe extern "C" fn wifi_rx_cb(buf: *mut core::ffi::c_void, _typ: u32) {
-    if buf.is_null() {
+    if !WIFI_ON.load(Ordering::Relaxed) || buf.is_null() {
         return;
     }
     let pkt = &*(buf as *const wifi_promiscuous_pkt_t);
@@ -118,9 +153,7 @@ unsafe extern "C" fn wifi_rx_cb(buf: *mut core::ffi::c_void, _typ: u32) {
     let avail = payload.len().min(sig_len);
     let copy = clamp_copy_len(sig_len, avail, SNAP_COPY);
     if copy < sig_len {
-        if let Ok(mut d) = DROPS.lock() {
-            d.truncated = d.truncated.saturating_add(1);
-        }
+        DROP_TRUNC.fetch_add(1, Ordering::Relaxed);
     }
     let channel = ctrl.channel() as u8;
     let is_5ghz = channel >= 32;
@@ -133,13 +166,9 @@ unsafe extern "C" fn wifi_rx_cb(buf: *mut core::ffi::c_void, _typ: u32) {
         ts_ms: now_ms(),
         payload: payload[..copy].to_vec(),
     };
-    if let Ok(guard) = WIFI_TX.lock() {
-        if let Some(tx) = guard.as_ref() {
-            if let Err(TrySendError::Full(_)) = tx.try_send(captured) {
-                if let Ok(mut d) = DROPS.lock() {
-                    d.ring_overflow = d.ring_overflow.saturating_add(1);
-                }
-            }
+    if let Some(tx) = WIFI_TX.get() {
+        if let Err(TrySendError::Full(_)) = tx.try_send(captured) {
+            DROP_RING.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -203,12 +232,22 @@ fn apply_command(cfg: &mut DeviceConfig, line: &str) {
                             &encode_event(&ack()).unwrap_or_else(|_| "{\"event\":\"ack\"}".into()),
                         );
                     }
-                    Err(e) => emit(&encode_event(&error_event(e.to_string())).unwrap()),
+                    Err(e) => emit(
+                        &encode_event(&error_event(e.to_string()))
+                            .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()),
+                    ),
                 },
-                Err(e) => emit(&encode_event(&error_event(e.to_string())).unwrap()),
+                Err(e) => emit(
+                    &encode_event(&error_event(e.to_string()))
+                        .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()),
+                ),
             }
         }
-        Err(e) => emit(&encode_event(&error_event(e.to_string())).unwrap()),
+        Err(espcap_protocol::Error::UnknownCommand) => {}
+        Err(e) => emit(
+            &encode_event(&error_event(e.to_string()))
+                .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()),
+        ),
     }
 }
 
@@ -365,7 +404,18 @@ fn set_promisc_filter(mask: u32) {
     let filter = wifi_promiscuous_filter_t { filter_mask: mask };
     unsafe {
         let _ = esp_wifi_set_promiscuous_filter(&filter);
-        let _ = esp_wifi_set_promiscuous(true);
+    }
+}
+
+fn apply_radios(cfg: &DeviceConfig) {
+    let wifi = cfg.running && matches!(cfg.radio, Radio::Wifi | Radio::Both);
+    let ble = cfg.running && matches!(cfg.radio, Radio::Ble | Radio::Both);
+    WIFI_ON.store(wifi, Ordering::Relaxed);
+    unsafe {
+        let _ = esp_wifi_set_promiscuous(wifi);
+    }
+    if ble {
+        log::warn!("BLE requested; NimBLE host FFI is unavailable in this build");
     }
 }
 
@@ -389,7 +439,7 @@ fn hop_loop(running: Arc<AtomicBool>, cfg: Arc<Mutex<DeviceConfig>>) {
             }
             idx = idx.wrapping_add(1);
         }
-        thread::sleep(Duration::from_millis(u64::from(dwell.max(200))));
+        FreeRtos::delay_ms(u32::from(dwell.max(200)));
         let _ = running.load(Ordering::Relaxed);
     }
 }
@@ -397,7 +447,8 @@ fn hop_loop(running: Arc<AtomicBool>, cfg: Arc<Mutex<DeviceConfig>>) {
 fn main() -> Result<(), EspError> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
-    log::set_max_level(log::LevelFilter::Off);
+    log::set_max_level(log::LevelFilter::Warn);
+    usj_install();
 
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
@@ -409,16 +460,14 @@ fn main() -> Result<(), EspError> {
     wifi.start()?;
 
     let (wifi_tx, wifi_rx) = mpsc::sync_channel::<WifiPkt>(32);
-    *WIFI_TX.lock().unwrap() = Some(wifi_tx);
+    let _ = WIFI_TX.set(wifi_tx);
     let (ble_tx, ble_rx) = mpsc::sync_channel::<BlePkt>(32);
 
     unsafe {
         let _ = esp_wifi_set_promiscuous_rx_cb(Some(wifi_rx_cb));
-        let _ = esp_wifi_set_promiscuous(true);
     }
 
     let cfg = Arc::new(Mutex::new(DeviceConfig::default()));
-    *APP_CFG.lock().unwrap() = Some(Arc::clone(&cfg));
     let running = Arc::new(AtomicBool::new(true));
     {
         #[cfg(target_arch = "xtensa")]
@@ -444,185 +493,62 @@ fn main() -> Result<(), EspError> {
 
     let mut wifi_dedup: HashMap<[u8; 6], Dedup> = HashMap::new();
     let mut ble_dedup: HashMap<[u8; 6], Dedup> = HashMap::new();
-    let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
-    #[cfg(target_arch = "xtensa")]
-    {
-        use esp_idf_svc::hal::cpu::Core;
-        use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
-        ThreadSpawnConfiguration {
-            name: Some(c"cmd"),
-            stack_size: 8192,
-            priority: 5,
-            inherit: false,
-            pin_to_core: Some(Core::Core1),
-            ..Default::default()
-        }
-        .set()
-        .ok();
-    }
-    thread::Builder::new()
-        .name("cmd".into())
-        .stack_size(8192)
-        .spawn(move || {
-            let stdin = io::stdin();
-            for line in stdin.lock().lines() {
-                if let Ok(line) = line {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    if cmd_tx.send(line).is_err() {
-                        break;
-                    }
-                }
-            }
-        })
-        .ok();
-    #[cfg(target_arch = "xtensa")]
-    {
-        use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
-        ThreadSpawnConfiguration::default().set().ok();
-    }
-
+    let mut acc = Vec::new();
+    let mut tmp = [0u8; 256];
     let mut last_mask = 0u32;
+    {
+        let g = cfg.lock().unwrap();
+        reply_status(&g);
+    }
     loop {
-        if let Ok(pkt) = wifi_rx.try_recv() {
+        let n = unsafe { usb_serial_jtag_read_bytes(tmp.as_mut_ptr(), tmp.len() as u32, 0) };
+        if n > 0 {
+            acc.extend_from_slice(&tmp[..n as usize]);
+            if acc.len() > 4096 {
+                acc.clear();
+            }
+            while let Some(pos) = acc.iter().position(|&b| b == b'\n' || b == b'\r') {
+                let line = acc.drain(..=pos).collect::<Vec<_>>();
+                let line = String::from_utf8_lossy(&line);
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let mut g = cfg.lock().unwrap();
+                apply_command(&mut g, line);
+                let mask = g.promiscuous_filter_mask();
+                if mask != last_mask {
+                    last_mask = mask;
+                    set_promisc_filter(mask);
+                }
+                apply_radios(&g);
+            }
+        }
+        for _ in 0..8 {
+            let Ok(pkt) = wifi_rx.try_recv() else {
+                break;
+            };
             let g = cfg.lock().unwrap();
             if g.running && matches!(g.radio, Radio::Wifi | Radio::Both) {
                 maybe_emit_wifi(&g, &mut wifi_dedup, &pkt);
             }
         }
-        if let Ok(pkt) = ble_rx.try_recv() {
+        for _ in 0..8 {
+            let Ok(pkt) = ble_rx.try_recv() else {
+                break;
+            };
             let g = cfg.lock().unwrap();
             if g.running && matches!(g.radio, Radio::Ble | Radio::Both) {
                 maybe_emit_ble(&g, &mut ble_dedup, &pkt);
             }
         }
-        if let Ok(line) = cmd_rx.try_recv() {
-            let mut g = cfg.lock().unwrap();
-            apply_command(&mut g, &line);
-            let mask = g.promiscuous_filter_mask();
-            if mask != last_mask {
-                last_mask = mask;
-                set_promisc_filter(mask);
-            }
+        unsafe {
+            let _ = esp_task_wdt_reset();
         }
-        thread::sleep(Duration::from_millis(5));
+        FreeRtos::delay_ms(10);
     }
-}
-
-fn ms_to_625us(ms: u16) -> u16 {
-    ((u32::from(ms) * 8) / 5).clamp(16, 16_384) as u16
-}
-
-fn start_ble_disc(cfg: &DeviceConfig) {
-    let mut params = ble_gap_disc_params::default();
-    params.itvl = ms_to_625us(cfg.ble_interval_ms.max(10));
-    params.window = ms_to_625us(cfg.ble_window_ms.min(cfg.ble_interval_ms).max(10));
-    params.set_passive(u8::from(!cfg.ble_active));
-    params.set_filter_duplicates(0);
-    unsafe {
-        let _ = ble_gap_disc(
-            BLE_ADDR_PUBLIC as u8,
-            i32::MAX,
-            &params,
-            Some(ble_gap_cb),
-            core::ptr::null_mut(),
-        );
-    }
-}
-
-fn push_ble_report(addr: [u8; 6], addr_random: bool, rssi: i8, data: *const u8, length: u8) {
-    let adv = if data.is_null() || length == 0 {
-        Vec::new()
-    } else {
-        unsafe { core::slice::from_raw_parts(data, length as usize) }.to_vec()
-    };
-    let parsed = parse_adv(&adv);
-    let pkt = BlePkt {
-        addr,
-        addr_random,
-        rssi,
-        ts_ms: now_ms(),
-        name: parsed.name,
-        company_id: parsed.company_id,
-        adv,
-    };
-    if let Ok(guard) = BLE_TX.lock() {
-        if let Some(tx) = guard.as_ref() {
-            if let Err(TrySendError::Full(_)) = tx.try_send(pkt) {
-                if let Ok(mut d) = DROPS.lock() {
-                    d.ring_overflow = d.ring_overflow.saturating_add(1);
-                }
-            }
-        }
-    }
-}
-
-unsafe extern "C" fn ble_gap_cb(event: *mut ble_gap_event, _arg: *mut core::ffi::c_void) -> i32 {
-    if event.is_null() {
-        return 0;
-    }
-    let ev = &*event;
-    match u32::from(ev.type_) {
-        BLE_GAP_EVENT_DISC => {
-            let d = ev.__bindgen_anon_1.disc;
-            push_ble_report(
-                d.addr.val,
-                d.addr.type_ != BLE_ADDR_PUBLIC as u8,
-                d.rssi,
-                d.data,
-                d.length_data,
-            );
-        }
-        BLE_GAP_EVENT_EXT_DISC => {
-            let d = ev.__bindgen_anon_1.ext_disc;
-            push_ble_report(
-                d.addr.val,
-                d.addr.type_ != BLE_ADDR_PUBLIC as u8,
-                d.rssi,
-                d.data,
-                d.length_data,
-            );
-        }
-        BLE_GAP_EVENT_DISC_COMPLETE => {
-            if let Ok(guard) = APP_CFG.lock() {
-                if let Some(cfg) = guard.as_ref() {
-                    if let Ok(g) = cfg.lock() {
-                        start_ble_disc(&g);
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-    0
-}
-
-unsafe extern "C" fn ble_on_sync() {
-    if let Ok(guard) = APP_CFG.lock() {
-        if let Some(cfg) = guard.as_ref() {
-            if let Ok(g) = cfg.lock() {
-                start_ble_disc(&g);
-            }
-        }
-    }
-}
-
-unsafe extern "C" fn ble_on_reset(_reason: i32) {}
-
-unsafe extern "C" fn ble_host_task(_arg: *mut core::ffi::c_void) {
-    nimble_port_run();
-    nimble_port_freertos_deinit();
 }
 
 fn spawn_ble(tx: SyncSender<BlePkt>) {
-    *BLE_TX.lock().unwrap() = Some(tx);
-    unsafe {
-        if nimble_port_init() != 0 {
-            return;
-        }
-        ble_hs_cfg.sync_cb = Some(ble_on_sync);
-        ble_hs_cfg.reset_cb = Some(ble_on_reset);
-        nimble_port_freertos_init(Some(ble_host_task));
-    }
+    std::mem::forget(tx);
 }

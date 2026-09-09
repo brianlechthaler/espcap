@@ -19,3 +19,6 @@ serde.workspace = true
 serde_json.workspace = true
 serialport.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

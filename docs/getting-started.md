@@ -32,14 +32,20 @@ make firmware-s3
 make flash-s3
 ```
 
-`flash-s3` writes USB Serial/JTAG on `/dev/ttyACM0`. After reset, the device speaks JSON lines at 115200 8N1. On Linux, opening the port briefly asserts DTR and can reset the chip; wait a second after plugging in or running `espcap` before expecting a reply.
+`flash-s3` writes USB Serial/JTAG on `/dev/ttyACM0`. After reset, the device speaks JSON lines at 115200 8N1. On Linux, opening the port can pulse DTR and reset the chip; `espcap` waits for a `status` event (up to 15s) before sending commands.
 
 ## First capture
 
 ```bash
+espcap --port /dev/ttyACM0 set --radio wifi --mode discovery --format json --start
+serial-capture -d /dev/ttyACM0 --json --json-nested
+```
+
+Or record with the companion CLI (holds the port until Ctrl-C; JSONL is flushed per line):
+
+```bash
 espcap --port /dev/ttyACM0 set --radio wifi --mode discovery --format json
 espcap --port /dev/ttyACM0 start --json capture.jsonl
-# Ctrl-C when done; the USB port cannot be shared with serial-capture at the same time.
 ```
 
 PCAP (companion CLI only):
