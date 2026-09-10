@@ -1,25 +1,26 @@
 # espcap
 
-ESP32-S3 and ESP32-C5 firmware and host CLI for WiFi promiscuous capture and BLE advertisement scanning, focused on device and AP discovery.
+ESP32-S3 and ESP32-C5 firmware plus a host CLI for WiFi promiscuous capture and BLE advertisement scanning.
 
-This repository currently holds the implementation plan only. Firmware and CLI land in later PRs.
+Promiscuous capture of other people's traffic may be restricted. Use this only on networks and devices you are authorized to monitor.
 
-## Documentation
+## Docs
 
-- [Plan index](docs/plan/index.md)
-- [Architecture](docs/plan/architecture.md)
-- [On-wire protocol](docs/plan/protocol.md)
-- [Capture behavior](docs/plan/capture.md)
-- [Firmware](docs/plan/firmware.md)
-- [Host CLI](docs/plan/host.md)
-- [Execution phases](docs/plan/phases.md)
+- [Getting started](docs/getting-started.md)
+- [Architecture](docs/architecture.md)
+- [CLI](docs/features/cli.md)
+- [WiFi](docs/features/wifi.md)
+- [BLE](docs/features/ble.md)
+- [Implementation plan](docs/plan/index.md)
 
-## Requirements (planned)
+## Build
 
-- ESP32-S3 (`xtensa-esp32s3-espidf`) and ESP32-C5 (`riscv32imac-esp-espidf`)
-- Shared ESP32 toolkit at `~/.esp32-dev` (ESP-IDF + esp rustc)
-- Host: Rust stable, USB serial (`/dev/ttyACM*`; `/dev/ttyUSB*` only if a board exposes a USB-UART bridge)
+```bash
+make test
+make lint
+make firmware-s3
+make firmware-c5
+make flash-s3
+```
 
-## License
-
-TBD
+Requires the shared ESP32 toolkit at `~/.esp32-dev`. Host commands use `/dev/ttyACM*` (USB Serial/JTAG). `make firmware-c5` compiles only; do not flash C5 until that board is attached.

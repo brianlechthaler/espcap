@@ -1,0 +1,31 @@
+[package]
+name = "espcap-firmware"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[[bin]]
+name = "espcap-firmware"
+path = "src/main.rs"
+harness = false
+
+[dependencies]
+espcap-protocol = { path = "../crates/protocol" }
+esp-idf-svc = { version = "0.52.1", features = ["critical-section"] }
+log = "0.4"
+serde_json = "1"
+
+[build-dependencies]
+embuild = "0.33"
+
+[patch.crates-io]
+esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys.git" }
+esp-idf-hal = { git = "https://github.com/esp-rs/esp-idf-hal.git" }
+esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git" }
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"

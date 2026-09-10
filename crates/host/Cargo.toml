@@ -1,0 +1,24 @@
+[package]
+name = "espcap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Host CLI for ESP32-S3/C5 WiFi and BLE capture"
+
+[[bin]]
+name = "espcap"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+env_logger.workspace = true
+espcap-protocol.workspace = true
+log.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serialport.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
