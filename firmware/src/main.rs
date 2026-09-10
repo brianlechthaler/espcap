@@ -5,7 +5,8 @@ use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_svc::sys::{
     esp_task_wdt_reset, esp_timer_get_time, esp_wifi_set_channel, esp_wifi_set_promiscuous,
     esp_wifi_set_promiscuous_filter, esp_wifi_set_promiscuous_rx_cb, wifi_promiscuous_filter_t,
-    wifi_promiscuous_pkt_t, wifi_second_chan_t_WIFI_SECOND_CHAN_NONE, EspError,
+    wifi_promiscuous_pkt_t, wifi_promiscuous_pkt_type_t_WIFI_PKT_MISC,
+    wifi_second_chan_t_WIFI_SECOND_CHAN_NONE, EspError,
 };
 use esp_idf_svc::wifi::{ClientConfiguration, Configuration, EspWifi};
 use espcap_protocol::config::DropCounters;
@@ -14,30 +15,19 @@ use espcap_protocol::pcap::{
     DLT_BLUETOOTH_LE_LL_WITH_PHDR, DLT_IEEE802_11_RADIO, TYPE_BLE, TYPE_GLOBAL, TYPE_WIFI,
 };
 use espcap_protocol::types::{freq_mhz, hop_sequence, Chip, Mode, OutputFormat, Radio};
-use espcap_protocol::wifi::{clamp_copy_len, parse_80211, Discovery};
+use espcap_protocol::wifi::{parse_80211, Discovery};
 use espcap_protocol::{
     ack, ble_adv, ble_disc, encode_event, error_event, parse_line, wifi_ap, wifi_frame, wifi_sta,
-    Command, DeviceConfig,
+    Command, DeviceConfig, PushOutcome, WifiHdr, WifiRing, WifiSlot, WIFI_RING_SLOTS,
+    WIFI_SNAP_LEN,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-const SNAP_COPY: usize = 768;
 const DEDUP_COOLDOWN_MS: u64 = 5000;
-
-#[derive(Clone)]
-struct WifiPkt {
-    rssi: i8,
-    channel: u8,
-    freq_mhz: u16,
-    is_5ghz: bool,
-    rate: u8,
-    ts_ms: u64,
-    payload: Vec<u8>,
-}
 
 #[derive(Clone)]
 struct BlePkt {
@@ -58,7 +48,7 @@ struct Dedup {
     last_emit: u64,
 }
 
-static WIFI_TX: OnceLock<SyncSender<WifiPkt>> = OnceLock::new();
+static WIFI_RING: WifiRing = WifiRing::new();
 static WIFI_ON: AtomicBool = AtomicBool::new(false);
 static DROP_RING: AtomicU32 = AtomicU32::new(0);
 static DROP_CDC: AtomicU32 = AtomicU32::new(0);
@@ -85,7 +75,7 @@ fn usj_install() {
         return;
     }
     let mut cfg = UsjCfg {
-        tx_buffer_size: 1024,
+        tx_buffer_size: 4096,
         rx_buffer_size: 1024,
     };
     unsafe {
@@ -177,33 +167,44 @@ fn reply_status(cfg: &DeviceConfig) {
     }
 }
 
-unsafe extern "C" fn wifi_rx_cb(buf: *mut core::ffi::c_void, _typ: u32) {
+unsafe extern "C" fn wifi_rx_cb(buf: *mut core::ffi::c_void, typ: u32) {
     if !WIFI_ON.load(Ordering::Relaxed) || buf.is_null() {
         return;
     }
-    let pkt = &*(buf as *const wifi_promiscuous_pkt_t);
-    let ctrl = pkt.rx_ctrl;
-    let sig_len = ctrl.sig_len() as usize;
-    let payload = pkt.payload.as_slice(sig_len.max(1));
-    let avail = payload.len().min(sig_len);
-    let copy = clamp_copy_len(sig_len, avail, SNAP_COPY);
-    if copy < sig_len {
+    if typ == wifi_promiscuous_pkt_type_t_WIFI_PKT_MISC {
         DROP_TRUNC.fetch_add(1, Ordering::Relaxed);
+        return;
     }
+    let pkt = buf as *const wifi_promiscuous_pkt_t;
+    let ctrl = (*pkt).rx_ctrl;
+    let sig_len = ctrl.sig_len() as usize;
+    let n = sig_len.min(WIFI_SNAP_LEN);
+    let src = if n == 0 {
+        &[]
+    } else {
+        core::slice::from_raw_parts(core::ptr::addr_of!((*pkt).payload) as *const u8, n)
+    };
     let channel = ctrl.channel() as u8;
     let is_5ghz = channel >= 32;
-    let captured = WifiPkt {
-        rssi: ctrl.rssi() as i8,
-        channel,
-        freq_mhz: freq_mhz(channel, is_5ghz),
-        is_5ghz,
-        rate: ctrl.rate() as u8,
-        ts_ms: now_ms(),
-        payload: payload[..copy].to_vec(),
-    };
-    if let Some(tx) = WIFI_TX.get() {
-        if let Err(TrySendError::Full(_)) = tx.try_send(captured) {
+    match WIFI_RING.try_push(
+        WifiHdr {
+            rssi: ctrl.rssi() as i8,
+            channel,
+            freq_mhz: freq_mhz(channel, is_5ghz),
+            is_5ghz,
+            rate: ctrl.rate() as u8,
+            ts_ms: now_ms(),
+        },
+        src,
+        sig_len,
+    ) {
+        PushOutcome::Full => {
             DROP_RING.fetch_add(1, Ordering::Relaxed);
+        }
+        PushOutcome::Stored { truncated } => {
+            if truncated {
+                DROP_TRUNC.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -302,8 +303,8 @@ fn apply_command(cfg: &mut DeviceConfig, line: &str) -> bool {
     }
 }
 
-fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt: &WifiPkt) {
-    let Ok(parsed) = parse_80211(&pkt.payload) else {
+fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt: &WifiSlot) {
+    let Ok(parsed) = parse_80211(pkt.payload()) else {
         return;
     };
     let mac = parsed.addr2;
@@ -314,11 +315,11 @@ fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt:
         if cfg.format == OutputFormat::Json {
             if let Ok(s) = encode_event(&wifi_frame(
                 &mac,
-                pkt.rssi,
-                pkt.channel,
-                pkt.freq_mhz,
-                pkt.ts_ms,
-                &pkt.payload,
+                pkt.hdr.rssi,
+                pkt.hdr.channel,
+                pkt.hdr.freq_mhz,
+                pkt.hdr.ts_ms,
+                pkt.payload(),
             )) {
                 emit(&s);
             }
@@ -326,12 +327,12 @@ fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt:
             emit_bytes(&encode_frame(
                 TYPE_WIFI,
                 &wifi_pcap_payload(
-                    pkt.ts_ms,
-                    pkt.freq_mhz,
-                    pkt.is_5ghz,
-                    pkt.rssi,
-                    pkt.rate,
-                    &pkt.payload,
+                    pkt.hdr.ts_ms,
+                    pkt.hdr.freq_mhz,
+                    pkt.hdr.is_5ghz,
+                    pkt.hdr.rssi,
+                    pkt.hdr.rate,
+                    pkt.payload(),
                 ),
             ));
         }
@@ -345,27 +346,30 @@ fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt:
         Discovery::Sta { mac } => *mac,
     };
     let e = dedup.entry(key).or_insert(Dedup {
-        first: pkt.ts_ms,
-        last: pkt.ts_ms,
+        first: pkt.hdr.ts_ms,
+        last: pkt.hdr.ts_ms,
         hits: 0,
-        rssi: pkt.rssi,
+        rssi: pkt.hdr.rssi,
         last_emit: 0,
     });
     e.hits = e.hits.saturating_add(1);
-    e.last = pkt.ts_ms;
-    let rssi_jump = (e.rssi as i16 - pkt.rssi as i16).unsigned_abs() >= 6;
-    e.rssi = pkt.rssi;
-    if e.last_emit != 0 && pkt.ts_ms.saturating_sub(e.last_emit) < DEDUP_COOLDOWN_MS && !rssi_jump {
+    e.last = pkt.hdr.ts_ms;
+    let rssi_jump = (e.rssi as i16 - pkt.hdr.rssi as i16).unsigned_abs() >= 6;
+    e.rssi = pkt.hdr.rssi;
+    if e.last_emit != 0
+        && pkt.hdr.ts_ms.saturating_sub(e.last_emit) < DEDUP_COOLDOWN_MS
+        && !rssi_jump
+    {
         return;
     }
-    e.last_emit = pkt.ts_ms;
+    e.last_emit = pkt.hdr.ts_ms;
     let ev = match disc {
         Discovery::Ap { bssid } => wifi_ap(
             bssid,
-            pkt.rssi,
-            pkt.channel,
-            pkt.freq_mhz,
-            pkt.ts_ms,
+            pkt.hdr.rssi,
+            pkt.hdr.channel,
+            pkt.hdr.freq_mhz,
+            pkt.hdr.ts_ms,
             parsed.ssid.as_deref().unwrap_or(""),
             e.hits,
             e.first,
@@ -373,10 +377,10 @@ fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt:
         ),
         Discovery::Sta { mac } => wifi_sta(
             mac,
-            pkt.rssi,
-            pkt.channel,
-            pkt.freq_mhz,
-            pkt.ts_ms,
+            pkt.hdr.rssi,
+            pkt.hdr.channel,
+            pkt.hdr.freq_mhz,
+            pkt.hdr.ts_ms,
             parsed.ssid.as_deref(),
             e.hits,
             e.first,
@@ -511,8 +515,6 @@ fn main() -> Result<(), EspError> {
     }))?;
     wifi.start()?;
 
-    let (wifi_tx, wifi_rx) = mpsc::sync_channel::<WifiPkt>(32);
-    let _ = WIFI_TX.set(wifi_tx);
     let (ble_tx, ble_rx) = mpsc::sync_channel::<BlePkt>(32);
 
     unsafe {
@@ -527,10 +529,10 @@ fn main() -> Result<(), EspError> {
             use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
             ThreadSpawnConfiguration {
                 name: Some(c"hop"),
-                stack_size: 4096,
+                stack_size: 8192,
                 priority: 4,
                 inherit: false,
-                pin_to_core: None,
+                pin_to_core: Some(esp_idf_svc::hal::cpu::Core::Core1),
                 ..Default::default()
             }
             .set()
@@ -569,34 +571,40 @@ fn main() -> Result<(), EspError> {
                 if line.is_empty() {
                     continue;
                 }
-                let mut g = cfg.lock().unwrap();
-                if apply_command(&mut g, line) {
-                    save_cfg(&store, &g);
+                let mut local = cfg.lock().unwrap().clone();
+                let persist = apply_command(&mut local, line);
+                {
+                    let mut g = cfg.lock().unwrap();
+                    *g = local;
+                    if persist {
+                        save_cfg(&store, &g);
+                    }
+                    let mask = g.promiscuous_filter_mask();
+                    if mask != last_mask {
+                        last_mask = mask;
+                        set_promisc_filter(mask);
+                    }
+                    apply_radios(&g);
                 }
-                let mask = g.promiscuous_filter_mask();
-                if mask != last_mask {
-                    last_mask = mask;
-                    set_promisc_filter(mask);
-                }
-                apply_radios(&g);
             }
         }
-        for _ in 0..8 {
-            let Ok(pkt) = wifi_rx.try_recv() else {
-                break;
-            };
-            let g = cfg.lock().unwrap();
-            if g.running && matches!(g.radio, Radio::Wifi | Radio::Both) {
-                maybe_emit_wifi(&g, &mut wifi_dedup, &pkt);
+        let snap = cfg.lock().unwrap().clone();
+        if snap.running && matches!(snap.radio, Radio::Wifi | Radio::Both) {
+            for _ in 0..WIFI_RING_SLOTS {
+                let Some(pkt) = WIFI_RING.try_pop() else {
+                    break;
+                };
+                maybe_emit_wifi(&snap, &mut wifi_dedup, &pkt);
             }
+        } else {
+            while WIFI_RING.try_pop().is_some() {}
         }
         for _ in 0..8 {
             let Ok(pkt) = ble_rx.try_recv() else {
                 break;
             };
-            let g = cfg.lock().unwrap();
-            if g.running && matches!(g.radio, Radio::Ble | Radio::Both) {
-                maybe_emit_ble(&g, &mut ble_dedup, &pkt);
+            if snap.running && matches!(snap.radio, Radio::Ble | Radio::Both) {
+                maybe_emit_ble(&snap, &mut ble_dedup, &pkt);
             }
         }
         unsafe {

@@ -6,6 +6,7 @@ pub mod event;
 pub mod filter;
 pub mod mac;
 pub mod pcap;
+pub mod ring;
 pub mod types;
 pub mod wifi;
 
@@ -17,6 +18,7 @@ pub use event::{
     wifi_sta, Event,
 };
 pub use filter::{FilterEngine, FilterSpec};
+pub use ring::{PushOutcome, WifiHdr, WifiRing, WifiSlot, WIFI_RING_SLOTS, WIFI_SNAP_LEN};
 pub use types::{
     Chip, HopChannel, Mode, OutputFormat, Radio, WifiBand, WifiType, DEFAULT_CHANNELS_5GHZ,
     DEFAULT_HOPMASK,
@@ -58,6 +60,19 @@ mod tests {
         let _ = encode_line(&Command::Get).unwrap();
         let _ = FilterEngine::default();
         let _ = DropCounters::default();
+        let _ = WIFI_RING_SLOTS;
+        let _ = WIFI_SNAP_LEN;
+        let _ = WifiSlot::EMPTY;
+        let _ = WifiHdr {
+            rssi: 0,
+            channel: 1,
+            freq_mhz: 2412,
+            is_5ghz: false,
+            rate: 0,
+            ts_ms: 0,
+        };
+        let _ = PushOutcome::Full;
+        let _ = WifiRing::new();
         let _ = Event::Ack;
         let _ = Error::UnknownCommand;
         let _ = ble::parse_adv(&[]);
