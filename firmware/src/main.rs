@@ -544,7 +544,14 @@ fn main() -> Result<(), EspError> {
     }
 
     spawn_ble(ble_tx);
+    run_loop(&store, cfg, ble_rx);
+}
 
+fn run_loop(
+    store: &Option<EspNvs<NvsDefault>>,
+    cfg: Arc<Mutex<DeviceConfig>>,
+    ble_rx: mpsc::Receiver<BlePkt>,
+) -> ! {
     let mut wifi_dedup: HashMap<[u8; 6], Dedup> = HashMap::new();
     let mut ble_dedup: HashMap<[u8; 6], Dedup> = HashMap::new();
     let mut acc = Vec::new();
@@ -577,7 +584,7 @@ fn main() -> Result<(), EspError> {
                     let mut g = cfg.lock().unwrap();
                     *g = local;
                     if persist {
-                        save_cfg(&store, &g);
+                        save_cfg(store, &g);
                     }
                     let mask = g.promiscuous_filter_mask();
                     if mask != last_mask {
