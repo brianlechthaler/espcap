@@ -1,6 +1,7 @@
 pub mod ble;
 pub mod command;
 pub mod config;
+pub mod dedup;
 pub mod error;
 pub mod event;
 pub mod filter;
@@ -12,13 +13,16 @@ pub mod wifi;
 
 pub use command::{encode_line, parse_line, Command};
 pub use config::{DeviceConfig, DropCounters};
+pub use dedup::{MacLru, DEDUP_CAP};
 pub use error::Error;
 pub use event::{
     ack, ble_adv, ble_disc, encode_event, error_event, parse_event_line, wifi_ap, wifi_frame,
     wifi_sta, Event,
 };
 pub use filter::{FilterEngine, FilterSpec};
-pub use ring::{PushOutcome, WifiHdr, WifiRing, WifiSlot, WIFI_RING_SLOTS, WIFI_SNAP_LEN};
+pub use ring::{
+    rx_copy_len, PushOutcome, WifiHdr, WifiRing, WifiSlot, WIFI_RING_SLOTS, WIFI_SNAP_LEN,
+};
 pub use types::{
     Chip, HopChannel, Mode, OutputFormat, Radio, WifiBand, WifiType, DEFAULT_CHANNELS_5GHZ,
     DEFAULT_HOPMASK,
@@ -60,6 +64,8 @@ mod tests {
         let _ = encode_line(&Command::Get).unwrap();
         let _ = FilterEngine::default();
         let _ = DropCounters::default();
+        let _ = DEDUP_CAP;
+        let _ = MacLru::<u8>::new(1);
         let _ = WIFI_RING_SLOTS;
         let _ = WIFI_SNAP_LEN;
         let _ = WifiSlot::EMPTY;

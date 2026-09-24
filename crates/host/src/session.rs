@@ -8,7 +8,7 @@ fn is_timeout(e: &Error) -> bool {
 }
 
 fn skip_line(e: &Error) -> bool {
-    is_timeout(e) || matches!(e, Error::Msg(m) if m.starts_with("parse "))
+    is_timeout(e) || matches!(e, Error::Msg(m) if m.starts_with("parse ") || m == "line too long")
 }
 
 pub fn write_command(w: &mut impl Write, cmd: &Command) -> Result<(), Error> {
@@ -19,24 +19,73 @@ pub fn write_command(w: &mut impl Write, cmd: &Command) -> Result<(), Error> {
     Ok(())
 }
 
+pub const MAX_LINE: usize = 4096;
+
+pub fn sanitize_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(200).collect()
+}
+
+pub fn read_limited_line(r: &mut impl BufRead) -> Result<Option<String>, Error> {
+    let mut out = Vec::new();
+    loop {
+        let available = r.fill_buf()?;
+        if available.is_empty() {
+            if out.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        if let Some(i) = available.iter().position(|&b| b == b'\n') {
+            let take = i + 1;
+            if out.len() + take > MAX_LINE {
+                r.consume(take);
+                return Err(Error::msg("line too long"));
+            }
+            out.extend_from_slice(&available[..take]);
+            r.consume(take);
+            break;
+        }
+        if out.len() + available.len() > MAX_LINE {
+            let n = available.len();
+            r.consume(n);
+            discard_until_newline(r)?;
+            return Err(Error::msg("line too long"));
+        }
+        let n = available.len();
+        out.extend_from_slice(available);
+        r.consume(n);
+    }
+    Ok(Some(String::from_utf8_lossy(&out).into_owned()))
+}
+
+fn discard_until_newline(r: &mut impl BufRead) -> Result<(), Error> {
+    loop {
+        let available = r.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        if let Some(i) = available.iter().position(|&b| b == b'\n') {
+            r.consume(i + 1);
+            return Ok(());
+        }
+        let n = available.len();
+        r.consume(n);
+    }
+}
+
 pub fn read_event(r: &mut impl BufRead) -> Result<Event, Error> {
     loop {
-        let mut line = String::new();
-        let n = r.read_line(&mut line)?;
-        if n == 0 {
+        let Some(line) = read_limited_line(r)? else {
             return Err(Error::msg("eof"));
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Some(json) = trimmed.find('{').map(|i| &trimmed[i..]) else {
-            continue;
         };
-        match parse_event_line(json) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.starts_with('{') {
+            continue;
+        }
+        match parse_event_line(trimmed) {
             Ok(ev) => return Ok(ev),
             Err(e) => {
-                let snippet: String = json.chars().take(24).collect();
+                let snippet: String = sanitize_text(trimmed).chars().take(24).collect();
                 return Err(Error::msg(format!("parse {e} | {snippet}")));
             }
         }
@@ -55,7 +104,7 @@ pub fn read_status_for(r: &mut impl BufRead, timeout: Duration) -> Result<Event,
         }
         match read_event(r) {
             Ok(Event::Status(v)) => return Ok(Event::Status(v)),
-            Ok(Event::Error { msg }) => return Err(Error::msg(msg)),
+            Ok(Event::Error { msg }) => return Err(Error::msg(sanitize_text(&msg))),
             Ok(_) => {}
             Err(e) if skip_line(&e) => {}
             Err(e) => return Err(e),
@@ -75,7 +124,7 @@ pub fn wait_ack_for(r: &mut impl BufRead, timeout: Duration) -> Result<(), Error
         }
         match read_event(r) {
             Ok(Event::Ack) => return Ok(()),
-            Ok(Event::Error { msg }) => return Err(Error::msg(msg)),
+            Ok(Event::Error { msg }) => return Err(Error::msg(sanitize_text(&msg))),
             Ok(_) => {}
             Err(e) if skip_line(&e) => {}
             Err(e) => return Err(e),
@@ -124,8 +173,10 @@ mod tests {
         wait_ack(&mut rx).unwrap();
         let mut rx = Cursor::new(b"\n{\"event\":\"ack\"}\n".to_vec());
         wait_ack(&mut rx).unwrap();
-        let mut rx =
-            Cursor::new(b"I (349) esp_image: segment 4: size{\"event\":\"ack\"}\n".to_vec());
+        let mut rx = Cursor::new(
+            b"I (349) esp_image: segment 4: size{\"event\":\"ack\"}\n{\"event\":\"ack\"}\n"
+                .to_vec(),
+        );
         wait_ack(&mut rx).unwrap();
         let mut rx = Cursor::new(b"{\"event\":\"error\",\"msg\":\"no\"}\n".to_vec());
         assert!(wait_ack(&mut rx).is_err());
@@ -317,5 +368,76 @@ mod tests {
         let mut b = [0u8; 1];
         assert!(r.read(&mut b).is_err());
         assert_eq!(r.read(&mut b).unwrap(), 1);
+        let mut huge = vec![b'{'];
+        huge.extend(std::iter::repeat_n(b'a', 5000));
+        huge.extend_from_slice(b"\n{\"event\":\"ack\"}\n");
+        wait_ack(&mut Cursor::new(huge)).unwrap();
+        let mut esc = Cursor::new(b"{\"event\":\"error\",\"msg\":\"no\\u001b[2J\"}\n".to_vec());
+        let err = wait_ack(&mut esc).unwrap_err().to_string();
+        assert!(!err.contains('\u{1b}'));
+        assert!(err.contains("no"));
+        assert_eq!(sanitize_text("a\u{1b}\nb"), "ab");
+        assert!(read_limited_line(&mut Cursor::new(Vec::<u8>::new()))
+            .unwrap()
+            .is_none());
+        struct Pieces {
+            parts: Vec<Vec<u8>>,
+            i: usize,
+        }
+        impl BufRead for Pieces {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                if self.i >= self.parts.len() {
+                    Ok(&[])
+                } else {
+                    Ok(&self.parts[self.i])
+                }
+            }
+            fn consume(&mut self, n: usize) {
+                assert_eq!(n, self.parts[self.i].len());
+                self.i += 1;
+            }
+        }
+        impl Read for Pieces {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let src = self.fill_buf()?;
+                if src.is_empty() {
+                    return Ok(0);
+                }
+                let n = src.len().min(buf.len());
+                buf[..n].copy_from_slice(&src[..n]);
+                self.consume(n);
+                Ok(n)
+            }
+        }
+        let mut once = Pieces {
+            parts: vec![b"hi".to_vec()],
+            i: 0,
+        };
+        let mut tmp = [0u8; 8];
+        assert_eq!(once.read(&mut tmp).unwrap(), 2);
+        assert_eq!(once.read(&mut tmp).unwrap(), 0);
+        let mut split = Pieces {
+            parts: vec![
+                vec![b'x'; 3000],
+                vec![b'y'; 2000],
+                vec![b'z'; 50],
+                b"\n".to_vec(),
+            ],
+            i: 0,
+        };
+        assert!(read_limited_line(&mut split).is_err());
+        let mut eof_mid = Pieces {
+            parts: vec![vec![b'z'; 5000]],
+            i: 0,
+        };
+        assert!(read_limited_line(&mut eof_mid).is_err());
+        let mut partial = Pieces {
+            parts: vec![b"{\"event\":\"ack\"}".to_vec()],
+            i: 0,
+        };
+        assert!(read_limited_line(&mut partial)
+            .unwrap()
+            .unwrap()
+            .contains("ack"));
     }
 }

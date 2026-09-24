@@ -20,6 +20,12 @@ pub fn oui_of(mac: &[u8; 6]) -> [u8; 3] {
     [mac[0], mac[1], mac[2]]
 }
 
+pub fn visible_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '\u{FFFD}' && !c.is_control())
+        .collect()
+}
+
 fn parse_octets<const N: usize>(s: &str) -> Result<[u8; N], Error> {
     let hex: String = s.chars().filter(|c| *c != ':' && *c != '-').collect();
     if hex.len() != N * 2 {
@@ -67,5 +73,6 @@ mod tests {
         assert!(parse_mac("zz:zz:zz:zz:zz:zz").is_err());
         assert!(parse_oui("gggggg").is_err());
         assert_eq!(payload_hex(&[0xde, 0xad]), "dead");
+        assert_eq!(visible_text("A\u{1b}\nB\u{FFFD}"), "AB");
     }
 }

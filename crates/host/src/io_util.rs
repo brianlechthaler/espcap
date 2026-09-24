@@ -1,10 +1,11 @@
+use crate::session::read_limited_line;
 use crate::Error;
 use espcap_protocol::pcap::{
     decode_frames, pcap_global_header, DLT_BLUETOOTH_LE_LL_WITH_PHDR, DLT_IEEE802_11_RADIO,
     TYPE_BLE, TYPE_GLOBAL, TYPE_WIFI,
 };
 use espcap_protocol::{parse_event_line, Chip, Event, WifiBand};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -56,7 +57,7 @@ pub fn write_jsonl(path: &str, lines: impl Iterator<Item = String>) -> Result<()
         let mut out = io::stdout().lock();
         return write_lines(&mut out, lines);
     }
-    let mut f = File::create(path)?;
+    let mut f = create_private(Path::new(path))?;
     write_lines(&mut f, lines)
 }
 
@@ -71,8 +72,8 @@ impl PcapSinks {
     pub fn create(prefix: &Path) -> Result<Self, Error> {
         let wifi_path = prefix_with_suffix(prefix, "-wifi.pcap");
         let ble_path = prefix_with_suffix(prefix, "-ble.pcap");
-        let mut wifi = File::create(&wifi_path)?;
-        let mut ble = File::create(&ble_path)?;
+        let mut wifi = create_private(&wifi_path)?;
+        let mut ble = create_private(&ble_path)?;
         write_bytes(&mut wifi, &pcap_global_header(DLT_IEEE802_11_RADIO))?;
         write_bytes(&mut ble, &pcap_global_header(DLT_BLUETOOTH_LE_LL_WITH_PHDR))?;
         Ok(Self {
@@ -105,26 +106,22 @@ pub fn capture_json_from(r: &mut impl BufRead, path: &str) -> Result<(), Error> 
     let mut out: Box<dyn Write> = if path == "-" {
         Box::new(io::stdout().lock())
     } else {
-        Box::new(File::create(path)?)
+        Box::new(create_private(Path::new(path))?)
     };
-    let mut buf = String::new();
     loop {
-        buf.clear();
-        match r.read_line(&mut buf) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
-            Err(e) => return Err(e.into()),
-        }
-        let trimmed = buf.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Some(json) = trimmed.find('{').map(|i| &trimmed[i..]) else {
-            continue;
+        let line = match read_limited_line(r) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(Error::Msg(m)) if m == "line too long" => continue,
+            Err(Error::Io(e)) if e.kind() == io::ErrorKind::TimedOut => continue,
+            Err(e) => return Err(e),
         };
-        if parse_event_line(json).is_ok() {
-            writeln!(out, "{json}")?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.starts_with('{') {
+            continue;
+        }
+        if parse_event_line(trimmed).is_ok() {
+            writeln!(out, "{trimmed}")?;
             out.flush()?;
         }
     }
@@ -149,6 +146,17 @@ pub fn capture_pcap_from(r: &mut impl Read, prefix: &Path) -> Result<(), Error> 
     Ok(())
 }
 
+fn create_private(path: &Path) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 fn prefix_with_suffix(prefix: &Path, suffix: &str) -> PathBuf {
     let mut s = prefix.as_os_str().to_os_string();
     s.push(suffix);
@@ -163,6 +171,7 @@ mod tests {
     use espcap_protocol::{parse_event_line, WifiBand};
     use std::fs;
     use std::io::{self, BufReader, Cursor, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     #[test]
@@ -197,16 +206,19 @@ mod tests {
         let prefix = dir.join("capture");
         let mut sinks = PcapSinks::create(&prefix).unwrap();
         let mpdu = beacon_fixture([1; 6], "n");
-        let mut framed = encode_frame(TYPE_GLOBAL, &pcap_global_header(DLT_IEEE802_11_RADIO));
-        framed.extend_from_slice(&encode_frame(
-            TYPE_WIFI,
-            &wifi_pcap_payload(0, 2412, false, -30, 2, &mpdu),
-        ));
-        framed.extend_from_slice(&encode_frame(
-            TYPE_BLE,
-            &ble_pcap_payload(0, -50, 39, &[2; 6], true, &[0x01]),
-        ));
-        framed.extend_from_slice(&encode_frame(99, &[0]));
+        let mut framed =
+            encode_frame(TYPE_GLOBAL, &pcap_global_header(DLT_IEEE802_11_RADIO)).unwrap();
+        framed.extend_from_slice(
+            &encode_frame(TYPE_WIFI, &wifi_pcap_payload(0, 2412, false, -30, 2, &mpdu)).unwrap(),
+        );
+        framed.extend_from_slice(
+            &encode_frame(
+                TYPE_BLE,
+                &ble_pcap_payload(0, -50, 39, &[2; 6], true, &[0x01]),
+            )
+            .unwrap(),
+        );
+        framed.extend_from_slice(&encode_frame(99, &[0]).unwrap());
         let n = sinks.absorb(&framed).unwrap();
         assert_eq!(n, framed.len());
         let (w, b) = sinks.paths();
@@ -215,6 +227,8 @@ mod tests {
         let wifi_p = w.to_path_buf();
         let ble_p = b.to_path_buf();
         drop(sinks);
+        let mode = fs::metadata(&wifi_p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         assert!(fs::metadata(&wifi_p).unwrap().len() > 24);
         assert!(fs::metadata(&ble_p).unwrap().len() > 24);
 
@@ -310,6 +324,11 @@ mod tests {
         );
         let mut bad = Cursor::new(b"{\"not\":\"an event\"}\n");
         capture_json_from(&mut bad, json_path.to_str().unwrap()).unwrap();
+        let mut long = vec![b'{'];
+        long.extend(std::iter::repeat_n(b'a', 5000));
+        long.extend_from_slice(b"\n{\"event\":\"ack\"}\n");
+        capture_json_from(&mut Cursor::new(long), json_path.to_str().unwrap()).unwrap();
+        assert!(fs::read_to_string(&json_path).unwrap().contains("ack"));
         let _ = timed;
         let _ = fs::remove_dir_all(&dir);
     }
