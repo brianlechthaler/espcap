@@ -17,11 +17,10 @@ use espcap_protocol::pcap::{
 use espcap_protocol::types::{freq_mhz, hop_sequence, Chip, Mode, OutputFormat, Radio};
 use espcap_protocol::wifi::{parse_80211, Discovery};
 use espcap_protocol::{
-    ack, ble_adv, ble_disc, encode_event, error_event, parse_line, wifi_ap, wifi_frame, wifi_sta,
-    Command, DeviceConfig, PushOutcome, WifiHdr, WifiRing, WifiSlot, WIFI_RING_SLOTS,
-    WIFI_SNAP_LEN,
+    ack, ble_adv, ble_disc, encode_event, error_event, parse_line, rx_copy_len, wifi_ap,
+    wifi_frame, wifi_sta, Command, DeviceConfig, MacLru, PushOutcome, WifiHdr, WifiRing, WifiSlot,
+    DEDUP_CAP, WIFI_RING_SLOTS,
 };
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -178,7 +177,10 @@ unsafe extern "C" fn wifi_rx_cb(buf: *mut core::ffi::c_void, typ: u32) {
     let pkt = buf as *const wifi_promiscuous_pkt_t;
     let ctrl = (*pkt).rx_ctrl;
     let sig_len = ctrl.sig_len() as usize;
-    let n = sig_len.min(WIFI_SNAP_LEN);
+    let Some(n) = rx_copy_len(sig_len) else {
+        DROP_TRUNC.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
     let src = if n == 0 {
         &[]
     } else {
@@ -220,16 +222,19 @@ fn apply_command(cfg: &mut DeviceConfig, line: &str) -> bool {
             emit(&encode_event(&ack()).unwrap_or_else(|_| "{\"event\":\"ack\"}".into()));
             if cfg.format == OutputFormat::Pcap {
                 if matches!(cfg.radio, Radio::Wifi | Radio::Both) {
-                    emit_bytes(&encode_frame(
+                    if let Ok(frame) = encode_frame(
                         TYPE_GLOBAL,
                         &pcap_global_header(DLT_IEEE802_11_RADIO),
-                    ));
+                    ) {
+                        emit_bytes(&frame);
+                    }
                 }
                 if matches!(cfg.radio, Radio::Ble | Radio::Both) {
-                    emit_bytes(&encode_frame(
-                        TYPE_GLOBAL,
-                        &pcap_global_header(DLT_BLUETOOTH_LE_LL_WITH_PHDR),
-                    ));
+                    if let Ok(frame) =
+                        encode_frame(TYPE_GLOBAL, &pcap_global_header(DLT_BLUETOOTH_LE_LL_WITH_PHDR))
+                    {
+                        emit_bytes(&frame);
+                    }
                 }
             }
             true
@@ -313,7 +318,7 @@ fn wifi_visible(cfg: &DeviceConfig, parsed: &espcap_protocol::wifi::ParsedWifi) 
 }
 
 #[inline(never)]
-fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt: &WifiSlot) {
+fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut MacLru<Dedup>, pkt: &WifiSlot) {
     let Ok(parsed) = parse_80211(pkt.payload()) else {
         return;
     };
@@ -334,7 +339,7 @@ fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt:
                 emit(&s);
             }
         } else {
-            emit_bytes(&encode_frame(
+            if let Ok(frame) = encode_frame(
                 TYPE_WIFI,
                 &wifi_pcap_payload(
                     pkt.hdr.ts_ms,
@@ -344,7 +349,9 @@ fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt:
                     pkt.hdr.rate,
                     pkt.payload(),
                 ),
-            ));
+            ) {
+                emit_bytes(&frame);
+            }
         }
         return;
     }
@@ -356,7 +363,7 @@ fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt:
         if !cfg.filters.matches_wifi(&key, parsed.ssid.as_deref()) {
             continue;
         }
-        let e = dedup.entry(key).or_insert(Dedup {
+        let e = dedup.get_or_insert_with(key, || Dedup {
             first: pkt.hdr.ts_ms,
             last: pkt.hdr.ts_ms,
             hits: 0,
@@ -406,7 +413,7 @@ fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt:
     }
 }
 
-fn maybe_emit_ble(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt: &BlePkt) {
+fn maybe_emit_ble(cfg: &DeviceConfig, dedup: &mut MacLru<Dedup>, pkt: &BlePkt) {
     if !cfg
         .filters
         .matches_ble(&pkt.addr, pkt.name.as_deref(), pkt.company_id)
@@ -425,7 +432,7 @@ fn maybe_emit_ble(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt: 
                 emit(&s);
             }
         } else {
-            emit_bytes(&encode_frame(
+            if let Ok(frame) = encode_frame(
                 TYPE_BLE,
                 &ble_pcap_payload(
                     pkt.ts_ms,
@@ -435,11 +442,13 @@ fn maybe_emit_ble(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt: 
                     pkt.addr_random,
                     &pkt.adv,
                 ),
-            ));
+            ) {
+                emit_bytes(&frame);
+            }
         }
         return;
     }
-    let e = dedup.entry(pkt.addr).or_insert(Dedup {
+    let e = dedup.get_or_insert_with(pkt.addr, || Dedup {
         first: pkt.ts_ms,
         last: pkt.ts_ms,
         hits: 0,
@@ -592,8 +601,8 @@ fn run_loop(
     cfg: Arc<Mutex<DeviceConfig>>,
     ble_rx: mpsc::Receiver<BlePkt>,
 ) -> ! {
-    let mut wifi_dedup: HashMap<[u8; 6], Dedup> = HashMap::new();
-    let mut ble_dedup: HashMap<[u8; 6], Dedup> = HashMap::new();
+    let mut wifi_dedup = MacLru::new(DEDUP_CAP);
+    let mut ble_dedup = MacLru::new(DEDUP_CAP);
     let mut acc = Vec::new();
     let mut tmp = [0u8; 256];
     let mut last_mask;

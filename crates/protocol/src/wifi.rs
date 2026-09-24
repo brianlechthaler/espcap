@@ -1,4 +1,4 @@
-use crate::mac::format_mac;
+use crate::mac::{format_mac, visible_text};
 use crate::Error;
 
 pub const FC_TYPE_MGMT: u8 = 0;
@@ -134,11 +134,7 @@ fn extract_ssid(mpdu: &[u8], ie_off: usize) -> Option<String> {
                 .rposition(|&b| b != 0)
                 .map(|j| j + 1)
                 .unwrap_or(0);
-            let s: String = String::from_utf8_lossy(&raw[..n])
-                .chars()
-                .filter(|c| *c != '\u{FFFD}' && !c.is_control())
-                .collect();
-            return Some(s);
+            return Some(visible_text(&String::from_utf8_lossy(&raw[..n])));
         }
         i += len;
     }

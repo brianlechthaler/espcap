@@ -1,3 +1,5 @@
+use crate::mac::visible_text;
+
 /// Parsed BLE advertising data fields used in discovery events.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AdvFields {
@@ -22,7 +24,7 @@ pub fn parse_adv(data: &[u8]) -> AdvFields {
         match typ {
             0x08 | 0x09 => {
                 if fields.name.is_none() || typ == 0x09 {
-                    fields.name = Some(String::from_utf8_lossy(val).into_owned());
+                    fields.name = Some(visible_text(&String::from_utf8_lossy(val)));
                 }
             }
             0xff if val.len() >= 2 => {
@@ -59,6 +61,8 @@ mod tests {
         let f = parse_adv(&data);
         assert_eq!(f.name.as_deref(), Some("n1"));
         assert_eq!(f.company_id, Some(0x004c));
+        let noisy = [0x05, 0x09, b'A', 0x1b, b'\n', b'B'];
+        assert_eq!(parse_adv(&noisy).name.as_deref(), Some("AB"));
     }
 
     #[test]

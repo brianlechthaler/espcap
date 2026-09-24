@@ -162,7 +162,7 @@ impl DeviceConfig {
             ble_active: self.ble_active,
             wifi_types: &self.wifi_types,
             filters: self.filters.to_spec(),
-            running: self.running,
+            running: false,
         })?)
     }
 
@@ -212,7 +212,8 @@ impl DeviceConfig {
             p.wifi_types,
             p.filters,
         )?;
-        cfg.running = p.running;
+        cfg.running = false;
+        let _ = p.running;
         Ok(cfg)
     }
 
@@ -386,7 +387,7 @@ mod tests {
         assert_eq!(got.ble_interval_ms, 80);
         assert_eq!(got.ble_window_ms, 40);
         assert!(got.ble_active);
-        assert!(got.running);
+        assert!(!got.running);
         assert_eq!(got.filters, cfg.filters);
         assert!(DeviceConfig::restore(b"not-json").is_err());
         assert!(DeviceConfig::restore(br#"{"dwell_ms":1}"#).is_err());

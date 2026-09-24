@@ -18,14 +18,14 @@ pub struct SerialFrame {
     pub payload: Vec<u8>,
 }
 
-pub fn encode_frame(typ: u8, payload: &[u8]) -> Vec<u8> {
-    let len = payload.len() as u16;
+pub fn encode_frame(typ: u8, payload: &[u8]) -> Result<Vec<u8>, Error> {
+    let len = u16::try_from(payload.len()).map_err(|_| Error::TruncatedFrame)?;
     let mut out = Vec::with_capacity(5 + payload.len());
     out.extend_from_slice(&FRAME_MAGIC);
     out.push(typ);
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(payload);
-    out
+    Ok(out)
 }
 
 pub fn decode_frames(buf: &[u8]) -> (Vec<SerialFrame>, usize) {
@@ -173,7 +173,8 @@ mod tests {
 
     #[test]
     fn frame_round_trip_and_resync() {
-        let f = encode_frame(TYPE_WIFI, &[1, 2, 3]);
+        let f = encode_frame(TYPE_WIFI, &[1, 2, 3]).unwrap();
+        assert!(encode_frame(TYPE_WIFI, &vec![0u8; 65536]).is_err());
         assert_eq!(&f[..2], &FRAME_MAGIC);
         let (frames, n) = decode_frames(&f);
         assert_eq!(n, f.len());

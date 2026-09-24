@@ -3,6 +3,17 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const WIFI_RING_SLOTS: usize = 32;
 pub const WIFI_SNAP_LEN: usize = 768;
+pub const MAX_SIG_LEN: usize = 2500;
+
+/// Bytes safe to copy from a promiscuous callback. `None` when `sig_len` is
+/// larger than a normal 802.11 MPDU, so a bogus length is not sliced.
+pub fn rx_copy_len(sig_len: usize) -> Option<usize> {
+    if sig_len > MAX_SIG_LEN {
+        None
+    } else {
+        Some(sig_len.min(WIFI_SNAP_LEN))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WifiHdr {
@@ -205,5 +216,10 @@ mod tests {
         assert_eq!(ring.try_pop().unwrap().payload(), &[] as &[u8]);
         assert_eq!(WifiSlot::EMPTY.payload(), &[] as &[u8]);
         assert_eq!(WifiSlot::EMPTY.len, 0);
+        assert_eq!(rx_copy_len(0), Some(0));
+        assert_eq!(rx_copy_len(100), Some(100));
+        assert_eq!(rx_copy_len(WIFI_SNAP_LEN + 8), Some(WIFI_SNAP_LEN));
+        assert_eq!(rx_copy_len(MAX_SIG_LEN), Some(WIFI_SNAP_LEN));
+        assert_eq!(rx_copy_len(MAX_SIG_LEN + 1), None);
     }
 }
