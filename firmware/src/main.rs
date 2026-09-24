@@ -303,15 +303,25 @@ fn apply_command(cfg: &mut DeviceConfig, line: &str) -> bool {
     }
 }
 
+fn wifi_visible(cfg: &DeviceConfig, parsed: &espcap_protocol::wifi::ParsedWifi) -> bool {
+    let ssid = parsed.ssid.as_deref();
+    cfg.filters.matches_wifi(&parsed.addr2, ssid)
+        || cfg.filters.matches_wifi(&parsed.addr1, ssid)
+        || parsed
+            .addr3
+            .is_some_and(|mac| cfg.filters.matches_wifi(&mac, ssid))
+}
+
+#[inline(never)]
 fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt: &WifiSlot) {
     let Ok(parsed) = parse_80211(pkt.payload()) else {
         return;
     };
-    let mac = parsed.addr2;
-    if !cfg.filters.matches_wifi(&mac, parsed.ssid.as_deref()) {
-        return;
-    }
     if cfg.mode == Mode::Capture {
+        if !wifi_visible(cfg, &parsed) {
+            return;
+        }
+        let mac = parsed.addr2;
         if cfg.format == OutputFormat::Json {
             if let Ok(s) = encode_event(&wifi_frame(
                 &mac,
@@ -338,58 +348,60 @@ fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut HashMap<[u8; 6], Dedup>, pkt:
         }
         return;
     }
-    let Some(disc) = &parsed.discovery else {
-        return;
-    };
-    let key = match disc {
-        Discovery::Ap { bssid } => *bssid,
-        Discovery::Sta { mac } => *mac,
-    };
-    let e = dedup.entry(key).or_insert(Dedup {
-        first: pkt.hdr.ts_ms,
-        last: pkt.hdr.ts_ms,
-        hits: 0,
-        rssi: pkt.hdr.rssi,
-        last_emit: 0,
-    });
-    e.hits = e.hits.saturating_add(1);
-    e.last = pkt.hdr.ts_ms;
-    let rssi_jump = (e.rssi as i16 - pkt.hdr.rssi as i16).unsigned_abs() >= 6;
-    e.rssi = pkt.hdr.rssi;
-    if e.last_emit != 0
-        && pkt.hdr.ts_ms.saturating_sub(e.last_emit) < DEDUP_COOLDOWN_MS
-        && !rssi_jump
-    {
-        return;
-    }
-    e.last_emit = pkt.hdr.ts_ms;
-    let ev = match disc {
-        Discovery::Ap { bssid } => wifi_ap(
-            bssid,
-            pkt.hdr.rssi,
-            pkt.hdr.channel,
-            pkt.hdr.freq_mhz,
-            pkt.hdr.ts_ms,
-            parsed.ssid.as_deref().unwrap_or(""),
-            e.hits,
-            e.first,
-            e.last,
-        ),
-        Discovery::Sta { mac } => wifi_sta(
-            mac,
-            pkt.hdr.rssi,
-            pkt.hdr.channel,
-            pkt.hdr.freq_mhz,
-            pkt.hdr.ts_ms,
-            parsed.ssid.as_deref(),
-            e.hits,
-            e.first,
-            e.last,
-        ),
-    };
-    if cfg.format == OutputFormat::Json {
-        if let Ok(s) = encode_event(&ev) {
-            emit(&s);
+    for disc in parsed.discovery.into_iter().flatten() {
+        let key = match disc {
+            Discovery::Ap { bssid } => bssid,
+            Discovery::Sta { mac } => mac,
+        };
+        if !cfg.filters.matches_wifi(&key, parsed.ssid.as_deref()) {
+            continue;
+        }
+        let e = dedup.entry(key).or_insert(Dedup {
+            first: pkt.hdr.ts_ms,
+            last: pkt.hdr.ts_ms,
+            hits: 0,
+            rssi: pkt.hdr.rssi,
+            last_emit: 0,
+        });
+        e.hits = e.hits.saturating_add(1);
+        e.last = pkt.hdr.ts_ms;
+        let rssi_jump = (e.rssi as i16 - pkt.hdr.rssi as i16).unsigned_abs() >= 6;
+        e.rssi = pkt.hdr.rssi;
+        if e.last_emit != 0
+            && pkt.hdr.ts_ms.saturating_sub(e.last_emit) < DEDUP_COOLDOWN_MS
+            && !rssi_jump
+        {
+            continue;
+        }
+        e.last_emit = pkt.hdr.ts_ms;
+        let ev = match disc {
+            Discovery::Ap { bssid } => wifi_ap(
+                &bssid,
+                pkt.hdr.rssi,
+                pkt.hdr.channel,
+                pkt.hdr.freq_mhz,
+                pkt.hdr.ts_ms,
+                parsed.ssid.as_deref().unwrap_or(""),
+                e.hits,
+                e.first,
+                e.last,
+            ),
+            Discovery::Sta { mac } => wifi_sta(
+                &mac,
+                pkt.hdr.rssi,
+                pkt.hdr.channel,
+                pkt.hdr.freq_mhz,
+                pkt.hdr.ts_ms,
+                parsed.ssid.as_deref(),
+                e.hits,
+                e.first,
+                e.last,
+            ),
+        };
+        if cfg.format == OutputFormat::Json {
+            if let Ok(s) = encode_event(&ev) {
+                emit(&s);
+            }
         }
     }
 }
@@ -514,6 +526,23 @@ fn main() -> Result<(), EspError> {
     log::set_max_level(log::LevelFilter::Warn);
     usj_install();
 
+    // std::thread ignores esp_pthread_set_cfg stack size and keeps the 8KB
+    // pthread default. Wi-Fi start needs more than the 16KB main task.
+    thread::Builder::new()
+        .name("app".into())
+        .stack_size(24 * 1024)
+        .spawn(|| {
+            if let Err(e) = app() {
+                log::error!("app: {e:?}");
+            }
+        })
+        .expect("app thread");
+    loop {
+        FreeRtos::delay_ms(1000);
+    }
+}
+
+fn app() -> Result<(), EspError> {
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
@@ -557,6 +586,7 @@ fn main() -> Result<(), EspError> {
     run_loop(&store, cfg, ble_rx);
 }
 
+#[inline(never)]
 fn run_loop(
     store: &Option<EspNvs<NvsDefault>>,
     cfg: Arc<Mutex<DeviceConfig>>,

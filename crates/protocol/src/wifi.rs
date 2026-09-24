@@ -24,10 +24,11 @@ pub struct ParsedWifi {
     pub addr2: [u8; 6],
     pub addr3: Option<[u8; 6]>,
     pub ssid: Option<String>,
-    pub discovery: Option<Discovery>,
+    /// AP first, then up to two stations (probe-response receiver, data SA/DA).
+    pub discovery: [Option<Discovery>; 3],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Discovery {
     Ap { bssid: [u8; 6] },
     Sta { mac: [u8; 6] },
@@ -81,12 +82,30 @@ pub fn parse_80211(mpdu: &[u8]) -> Result<ParsedWifi, Error> {
     } else {
         None
     };
-    let discovery = match (kind, subtype) {
-        (FrameKind::Mgmt, SUBTYPE_BEACON | SUBTYPE_PROBE_RESP) => Some(Discovery::Ap {
-            bssid: addr3.unwrap_or(addr2),
-        }),
-        (FrameKind::Mgmt, SUBTYPE_PROBE_REQ) => Some(Discovery::Sta { mac: addr2 }),
-        _ => None,
+    let mut discovery = [None, None, None];
+    match (kind, subtype) {
+        (FrameKind::Mgmt, SUBTYPE_BEACON | SUBTYPE_PROBE_RESP) => {
+            let bssid = addr3.unwrap_or(addr2);
+            push_disc(&mut discovery, Discovery::Ap { bssid });
+            if subtype == SUBTYPE_PROBE_RESP && addr1 != bssid {
+                push_sta(&mut discovery, addr1);
+            }
+        }
+        (FrameKind::Mgmt, SUBTYPE_PROBE_REQ) => {
+            push_disc(&mut discovery, Discovery::Sta { mac: addr2 });
+        }
+        (FrameKind::Data, _) => match (mpdu[1] & 0x01 != 0, mpdu[1] & 0x02 != 0) {
+            (false, true) => push_sta(&mut discovery, addr1),
+            (true, false) => push_sta(&mut discovery, addr2),
+            (false, false) => {
+                push_sta(&mut discovery, addr1);
+                if addr2 != addr1 {
+                    push_sta(&mut discovery, addr2);
+                }
+            }
+            (true, true) => {}
+        },
+        _ => {}
     };
     Ok(ParsedWifi {
         kind,
@@ -126,12 +145,32 @@ fn extract_ssid(mpdu: &[u8], ie_off: usize) -> Option<String> {
     None
 }
 
-pub fn discovery_mac(parsed: &ParsedWifi) -> Option<[u8; 6]> {
-    match parsed.discovery {
-        Some(Discovery::Ap { bssid }) => Some(bssid),
-        Some(Discovery::Sta { mac }) => Some(mac),
-        None => None,
+fn is_unicast(mac: &[u8; 6]) -> bool {
+    mac[0] & 1 == 0
+}
+
+fn push_disc(out: &mut [Option<Discovery>; 3], item: Discovery) {
+    if let Some(slot) = out.iter_mut().find(|s| s.is_none()) {
+        *slot = Some(item);
     }
+}
+
+fn push_sta(out: &mut [Option<Discovery>; 3], mac: [u8; 6]) {
+    if is_unicast(&mac) {
+        push_disc(out, Discovery::Sta { mac });
+    }
+}
+
+pub fn discovery_mac(parsed: &ParsedWifi) -> Option<[u8; 6]> {
+    parsed
+        .discovery
+        .into_iter()
+        .flatten()
+        .next()
+        .map(|d| match d {
+            Discovery::Ap { bssid } => bssid,
+            Discovery::Sta { mac } => mac,
+        })
 }
 
 pub fn bssid_string(mac: &[u8; 6]) -> String {
@@ -186,7 +225,7 @@ mod tests {
         assert_eq!(p.kind, FrameKind::Mgmt);
         assert_eq!(p.subtype, SUBTYPE_BEACON);
         assert_eq!(p.ssid.as_deref(), Some("Flock"));
-        assert_eq!(p.discovery, Some(Discovery::Ap { bssid }));
+        assert_eq!(p.discovery, [Some(Discovery::Ap { bssid }), None, None]);
         assert_eq!(discovery_mac(&p), Some(bssid));
         assert_eq!(bssid_string(&bssid), "11:22:33:44:55:66");
         let sta = parse_80211(&probe_req_fixture([0xaa; 6], Some("Flock"))).unwrap();
@@ -197,7 +236,10 @@ mod tests {
 
         let pr = probe_req_fixture([0xaa; 6], Some("Flock"));
         let p = parse_80211(&pr).unwrap();
-        assert_eq!(p.discovery, Some(Discovery::Sta { mac: [0xaa; 6] }));
+        assert_eq!(
+            p.discovery,
+            [Some(Discovery::Sta { mac: [0xaa; 6] }), None, None]
+        );
         assert_eq!(p.ssid.as_deref(), Some("Flock"));
 
         let pv = probe_resp_fixture(bssid, "x");
@@ -207,7 +249,7 @@ mod tests {
         data.extend_from_slice(&[1u8; 20]);
         let p = parse_80211(&data).unwrap();
         assert_eq!(p.kind, FrameKind::Data);
-        assert!(p.discovery.is_none());
+        assert_eq!(p.discovery, [None, None, None]);
 
         let mut ctrl = vec![0xb4, 0, 0, 0];
         ctrl.extend_from_slice(&[2u8; 12]);
@@ -240,6 +282,95 @@ mod tests {
             .unwrap()
             .ssid
             .is_none());
+    }
+
+    fn data_frame(fc1: u8, addr1: [u8; 6], addr2: [u8; 6]) -> Vec<u8> {
+        let mut f = vec![0x08, fc1, 0, 0];
+        f.extend_from_slice(&addr1);
+        f.extend_from_slice(&addr2);
+        f.extend_from_slice(&[0x11; 6]);
+        f.extend_from_slice(&[0, 0]);
+        f
+    }
+
+    #[test]
+    fn probe_resp_and_data_discover_stations() {
+        let bssid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let sta = [0x3c, 0x71, 0xbf, 0xd2, 0x2a, 0x70];
+        let other = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let mut pv = probe_resp_fixture(bssid, "x");
+        pv[4..10].copy_from_slice(&sta);
+        assert_eq!(
+            parse_80211(&pv).unwrap().discovery,
+            [
+                Some(Discovery::Ap { bssid }),
+                Some(Discovery::Sta { mac: sta }),
+                None
+            ]
+        );
+        let mut same = probe_resp_fixture(bssid, "x");
+        same[4..10].copy_from_slice(&bssid);
+        assert_eq!(
+            parse_80211(&same).unwrap().discovery,
+            [Some(Discovery::Ap { bssid }), None, None]
+        );
+        let mut beacon = beacon_fixture(bssid, "x");
+        beacon[4..10].copy_from_slice(&sta);
+        assert_eq!(
+            parse_80211(&beacon).unwrap().discovery,
+            [Some(Discovery::Ap { bssid }), None, None]
+        );
+
+        assert_eq!(
+            parse_80211(&data_frame(0x02, sta, bssid))
+                .unwrap()
+                .discovery,
+            [Some(Discovery::Sta { mac: sta }), None, None]
+        );
+        assert_eq!(
+            parse_80211(&data_frame(0x01, bssid, sta))
+                .unwrap()
+                .discovery,
+            [Some(Discovery::Sta { mac: sta }), None, None]
+        );
+        assert_eq!(
+            parse_80211(&data_frame(0x00, sta, other))
+                .unwrap()
+                .discovery,
+            [
+                Some(Discovery::Sta { mac: sta }),
+                Some(Discovery::Sta { mac: other }),
+                None
+            ]
+        );
+        assert_eq!(
+            parse_80211(&data_frame(0x00, sta, sta)).unwrap().discovery,
+            [Some(Discovery::Sta { mac: sta }), None, None]
+        );
+        assert_eq!(
+            parse_80211(&data_frame(0x02, [0x01, 0, 0, 0, 0, 1], bssid))
+                .unwrap()
+                .discovery,
+            [None, None, None]
+        );
+        assert_eq!(
+            parse_80211(&data_frame(0x01, bssid, [0xff; 6]))
+                .unwrap()
+                .discovery,
+            [None, None, None]
+        );
+        assert_eq!(
+            parse_80211(&data_frame(0x03, sta, other))
+                .unwrap()
+                .discovery,
+            [None, None, None]
+        );
+        assert_eq!(
+            parse_80211(&data_frame(0x00, [0x01; 6], other))
+                .unwrap()
+                .discovery,
+            [Some(Discovery::Sta { mac: other }), None, None]
+        );
     }
 
     #[test]
