@@ -1,0 +1,12 @@
+[package]
+name = "espcap-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared espcap commands, filters, JSON events, and PCAP framing"
+
+[dependencies]
+regex-lite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

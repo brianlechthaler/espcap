@@ -1,4 +1,8 @@
 /target
+firmware/target
+firmware/.embuild
+firmware/sdkconfig
+firmware/sdkconfig.old
 **/*.rs.bk
 .idea/
 .vscode/

@@ -1,0 +1,2 @@
+# Single HP core: do not pin Wi-Fi or NimBLE to a second core.
+CONFIG_ESP_WIFI_TASK_CORE_ID=0

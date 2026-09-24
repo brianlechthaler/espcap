@@ -36,13 +36,11 @@ BLE company IDs are a separate firmware filter, not IEEE OUI names.
 JSON mode at 115200, one JSON object per `\n` line, matches serial-capture:
 
 ```bash
-espcap set --port /dev/ttyACM0 --format json --mode discovery --radio both
-espcap start --port /dev/ttyACM0
-# then, after closing espcap so the port is free:
+espcap --port /dev/ttyACM0 set --radio both --mode discovery --format json --start
 serial-capture -d /dev/ttyACM0 --json --json-nested
 ```
 
-The USB serial port cannot be opened by both tools at once. Document that.
+`set --start` (or `start --detach`) sends `start`, waits for ack, and exits so the port is free. The USB serial port cannot be opened by both tools at once.
 
 PCAP mode: only `espcap` should own the port.
 
