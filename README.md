@@ -8,9 +8,11 @@ Promiscuous capture of other people's traffic may be restricted. Use this only o
 
 - [Getting started](docs/getting-started.md)
 - [Architecture](docs/architecture.md)
+- [Documentation index](docs/index.md)
 - [CLI](docs/features/cli.md)
 - [WiFi](docs/features/wifi.md)
 - [BLE](docs/features/ble.md)
+- [Serial protocol](docs/features/protocol.md)
 - [Implementation plan](docs/plan/index.md)
 
 ## Build

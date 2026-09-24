@@ -1,14 +1,18 @@
 # Architecture
 
-See the implementation plan in [plan/architecture.md](plan/architecture.md) for radio/core mapping.
+Host CLI and firmware share `crates/protocol`. Firmware is `firmware/`, built twice (`xtensa-esp32s3-espidf`, `riscv32imac-esp-espidf`). The CLI is `crates/host`.
 
 ```mermaid
 flowchart LR
-  Wifi[WiFi_promisc] --> Ring[rings]
-  Ble[BLE_scan] --> Ring
-  Ring --> Filter --> Enc[JSON_or_PCAP]
-  Enc --> USB[USB_Serial_JTAG]
-  CLI[espcap_CLI] --> USB
+  Wifi[WiFi promiscuous] --> Ring[32-slot ring]
+  Ring --> Mode{discovery or capture}
+  Mode --> Enc[JSON or framed PCAP]
+  Enc --> USB[USB Serial/JTAG]
+  CLI[espcap CLI] --> USB
 ```
 
-Shared types live in `crates/protocol`. The host CLI is `crates/host`. Firmware is a separate crate in `firmware/` built twice (`xtensa-esp32s3-espidf`, `riscv32imac-esp-espidf`).
+WiFi RX copies into the ring and returns. A later task parses, filters, dedups discovery, and writes the serial port. Config (including `running`) is stored in NVS under namespace `espcap`.
+
+The BLE encode path is in the same task. This build does not start a NimBLE scan, so that path receives no packets. See [BLE](features/ble.md).
+
+Chip limits and the original core map are in [plan/architecture.md](plan/architecture.md).
