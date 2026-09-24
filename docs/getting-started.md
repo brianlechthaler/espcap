@@ -7,9 +7,9 @@ Promiscuous capture of other people's traffic may be restricted. Use this only o
 | Board | USB serial | WiFi |
 |-------|------------|------|
 | ESP32-S3 | `/dev/ttyACM0` (USB Serial/JTAG) | 2.4 GHz |
-| ESP32-C5 | `/dev/ttyACM*` | 2.4 GHz and 5 GHz |
+| ESP32-C5 | `/dev/ttyACM1` (USB Serial/JTAG) | 2.4 GHz and 5 GHz |
 
-This repo flashes and tests the S3 first. C5 firmware builds with `make firmware-c5`; hardware bring-up waits until that board is attached.
+`make flash-s3` writes the S3 on `/dev/ttyACM0`. `make flash-c5` writes the C5 (`C5_PORT`, default `/dev/ttyACM1`). Confirm the port with `esptool chip-id` before flashing so the two boards are not swapped.
 
 ## Host tools
 
@@ -29,7 +29,9 @@ Use the shared prefix `$HOME/.esp32-dev` (or `$ESP32_DEV_PREFIX`). Do not pip-in
 ```bash
 source "${ESP32_DEV_PREFIX:-$HOME/.esp32-dev}/activate.sh"
 make firmware-s3
+make firmware-c5
 make flash-s3
+make flash-c5
 ```
 
 `flash-s3` writes USB Serial/JTAG on `/dev/ttyACM0`. After reset, the device speaks JSON lines at 115200 8N1. `espcap` deasserts RTS then DTR so Linux CDC-ACM does not reset the S3, then waits for a `status` event (up to 15s) before sending commands.
