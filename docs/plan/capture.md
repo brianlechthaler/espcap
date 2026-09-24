@@ -6,10 +6,10 @@ Model WiFi and BLE capture after [oui-spy-unified-blue](https://github.com/colon
 
 **Discovery** (device and AP inventory; Flock-You / Detector style):
 
-- WiFi: Beacon, Probe Request, Probe Response only. Extract BSSID / addr2 / addr3, SSID, RSSI, channel, frequency, frame subtype. Dedupe by MAC. Emit on first seen and on cooldown or RSSI change.
+- WiFi: Beacon, Probe Request, and Probe Response, plus stations taken from data frames (From DS receiver, To DS transmitter, or both when neither DS bit is set). Extract BSSID or station MAC, SSID when present, RSSI, channel, frequency. Dedupe by MAC. Emit on first seen and on cooldown or RSSI change. See [WiFi](../features/wifi.md).
 - BLE: advertisements, passive scan, duplicates on. Extract addr, addr_type, RSSI, local name, company ID, service UUIDs, TxPower if present. Extended advertising PDUs are in scope (both chips support BLE 5 scan).
 - Default hop: 2.4 GHz channels **1, 6, 11**, dwell **300 ms** (configurable 100–2000 ms). Flock-You’s 11→6→1 at 250 ms is an optional hop profile, not the default.
-- C5 5 GHz discovery: only when `wifi_band` is `5` or `both` and `channels_5ghz` is non-empty. Default 5 GHz list is UNII-1 **36, 40, 44, 48**. Do not hop DFS channels unless the user sets them.
+- C5 5 GHz discovery: when `wifi_band` is `5` or `both`. An empty `channels_5ghz` list uses UNII-1 **36, 40, 44, 48**. Do not hop DFS channels unless the user sets them.
 
 **Capture** (general traffic; oui-spy PCAP mode):
 

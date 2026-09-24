@@ -26,7 +26,7 @@ Field notes:
 - `wifi_band`: `2.4`, `5`, or `both`. Default `2.4`. **ESP32-S3** accepts `2.4` only; `5` or `both` → `error`. **ESP32-C5** accepts all three.
 - `dwell_ms`: WiFi hop dwell, 100–2000, default 300
 - `hopmask`: 14-bit mask for **2.4 GHz** channels 1–14, bit `(ch-1)` = channel `ch`. Default `0x0421` = channels 1, 6, 11. Ignored when `wifi_band` is `5`.
-- `channels_5ghz`: IEEE 5 GHz channel numbers (for example UNII-1 `36,40,44,48`). Default empty (no 5 GHz hop). C5 only; S3 → `error` if non-empty.
+- `channels_5ghz`: IEEE 5 GHz channel numbers. Stored default is empty. When `wifi_band` is `5` or `both` and the list is empty, the hop sequence uses UNII-1 `36, 40, 44, 48`. C5 only; S3 → `error` if non-empty.
 - `ble_interval_ms` / `ble_window_ms`: NimBLE scan timing (milliseconds)
 - `ble_active`: default `false` (passive, match oui-spy BLE Sniff)
 - `wifi_types`: subset of `mgmt`, `ctrl`, `data`
@@ -82,7 +82,7 @@ Channel frequency in radiotap:
 
 BLE PHDR: channel 39 if NimBLE does not expose RF channel; reconstruct access address `D6 BE 89 8E` as in `blesniff.cpp`.
 
-The CLI writes `out-wifi.pcap` and `out-ble.pcap` (or one file if a single radio is enabled). Classic PCAP cannot mix DLTs.
+The CLI writes `<prefix>-wifi.pcap` and `<prefix>-ble.pcap`. Classic PCAP cannot mix DLTs, so both files are created even when one radio is off.
 
 Do not stream raw unframed PCAP. S3/C5 native CDC is less reliable at high rate than a USB-UART bridge; resync still needs a magic.
 
