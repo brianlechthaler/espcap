@@ -1,4 +1,6 @@
-.PHONY: test lint fmt coverage firmware-s3 firmware-c5
+.PHONY: test lint fmt coverage firmware-s3 firmware-c5 flash-s3 flash-c5
+
+C5_PORT ?= /dev/ttyACM1
 
 CARGO ?= cargo +stable
 ESP32_WITH_ENV ?= $(HOME)/.cursor/skills/esp32-dev/scripts/with-env.sh
@@ -24,3 +26,6 @@ firmware-c5:
 
 flash-s3:
 	cd firmware && MCU=esp32s3 IDF_MAINTAINER=1 $(ESP32_WITH_ENV) cargo espflash flash --release --target xtensa-esp32s3-espidf --port /dev/ttyACM0 --partition-table partitions.csv --flash-size 8mb
+
+flash-c5:
+	cd firmware && MCU=esp32c5 IDF_MAINTAINER=1 $(ESP32_WITH_ENV) cargo espflash flash --release --target riscv32imac-esp-espidf --port $(C5_PORT) --partition-table partitions.csv --flash-size 8mb

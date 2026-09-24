@@ -21,6 +21,7 @@ make lint
 make firmware-s3
 make firmware-c5
 make flash-s3
+make flash-c5
 ```
 
-Requires the shared ESP32 toolkit at `~/.esp32-dev`. Host commands use `/dev/ttyACM*` (USB Serial/JTAG). `make firmware-c5` compiles only; do not flash C5 until that board is attached.
+Requires the shared ESP32 toolkit at `~/.esp32-dev`. Host commands use `/dev/ttyACM*` (USB Serial/JTAG). `make flash-c5` writes `/dev/ttyACM1` by default (`C5_PORT` overrides it). Confirm that port is an ESP32-C5 before flashing; on this bench the S3 is `/dev/ttyACM0`.

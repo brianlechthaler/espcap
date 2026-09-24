@@ -3,9 +3,9 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_svc::sys::{
-    esp_task_wdt_reset, esp_timer_get_time, esp_wifi_set_channel, esp_wifi_set_promiscuous,
-    esp_wifi_set_promiscuous_filter, esp_wifi_set_promiscuous_rx_cb, wifi_promiscuous_filter_t,
-    wifi_promiscuous_pkt_t, wifi_promiscuous_pkt_type_t_WIFI_PKT_MISC,
+    esp_task_wdt_reset, esp_timer_get_time, esp_wifi_set_band_mode, esp_wifi_set_channel,
+    esp_wifi_set_promiscuous, esp_wifi_set_promiscuous_filter, esp_wifi_set_promiscuous_rx_cb,
+    wifi_promiscuous_filter_t, wifi_promiscuous_pkt_t, wifi_promiscuous_pkt_type_t_WIFI_PKT_MISC,
     wifi_second_chan_t_WIFI_SECOND_CHAN_NONE, EspError,
 };
 use esp_idf_svc::wifi::{ClientConfiguration, Configuration, EspWifi};
@@ -462,6 +462,15 @@ fn set_promisc_filter(mask: u32) {
     }
 }
 
+fn apply_wifi_band(cfg: &DeviceConfig) {
+    if !chip().supports_5ghz() {
+        return;
+    }
+    unsafe {
+        let _ = esp_wifi_set_band_mode(cfg.wifi_band.idf_band_mode());
+    }
+}
+
 fn apply_radios(cfg: &DeviceConfig) {
     let wifi = cfg.running && matches!(cfg.radio, Radio::Wifi | Radio::Both);
     let ble = cfg.running && matches!(cfg.radio, Radio::Ble | Radio::Both);
@@ -522,6 +531,7 @@ fn main() -> Result<(), EspError> {
     }
 
     let cfg = Arc::new(Mutex::new(load_cfg(&store)));
+    apply_wifi_band(&cfg.lock().unwrap());
     let running = Arc::new(AtomicBool::new(true));
     {
         #[cfg(target_arch = "xtensa")]
@@ -557,10 +567,13 @@ fn run_loop(
     let mut acc = Vec::new();
     let mut tmp = [0u8; 256];
     let mut last_mask;
+    let mut last_band;
     {
         let g = cfg.lock().unwrap();
         last_mask = g.promiscuous_filter_mask();
+        last_band = g.wifi_band;
         set_promisc_filter(last_mask);
+        apply_wifi_band(&g);
         apply_radios(&g);
         reply_status(&g);
     }
@@ -590,6 +603,10 @@ fn run_loop(
                     if mask != last_mask {
                         last_mask = mask;
                         set_promisc_filter(mask);
+                    }
+                    if g.wifi_band != last_band {
+                        last_band = g.wifi_band;
+                        apply_wifi_band(&g);
                     }
                     apply_radios(&g);
                 }

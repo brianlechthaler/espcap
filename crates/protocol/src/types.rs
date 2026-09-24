@@ -70,6 +70,15 @@ impl WifiBand {
     pub fn uses_5g(self) -> bool {
         !matches!(self, WifiBand::TwoG)
     }
+
+    /// IDF `wifi_band_mode_t`: 2.4 GHz only, 5 GHz only, or both.
+    pub fn idf_band_mode(self) -> u32 {
+        match self {
+            WifiBand::TwoG => 1,
+            WifiBand::FiveG => 2,
+            WifiBand::Both => 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +295,9 @@ mod tests {
         assert!(WifiBand::Both.uses_2g() && WifiBand::Both.uses_5g());
         assert!(!WifiBand::FiveG.uses_2g());
         assert!(!WifiBand::TwoG.uses_5g());
+        assert_eq!(WifiBand::TwoG.idf_band_mode(), 1);
+        assert_eq!(WifiBand::FiveG.idf_band_mode(), 2);
+        assert_eq!(WifiBand::Both.idf_band_mode(), 3);
     }
 
     #[test]
