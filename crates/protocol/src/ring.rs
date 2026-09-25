@@ -97,16 +97,35 @@ impl WifiRing {
         }
     }
 
-    pub fn try_pop(&self) -> Option<WifiSlot> {
+    pub fn is_empty(&self) -> bool {
+        self.read.load(Ordering::Relaxed) == self.write.load(Ordering::Acquire)
+    }
+
+    /// Runs `f` on the next slot, then publishes the pop. The slot is not copied.
+    pub fn with_next<R>(&self, f: impl FnOnce(&WifiSlot) -> R) -> Option<R> {
         let r = self.read.load(Ordering::Relaxed);
         let w = self.write.load(Ordering::Acquire);
         if r == w {
             return None;
         }
         // SAFETY: `r != w`, so the producer has Release-published this slot.
-        let slot = unsafe { *self.slots[r % WIFI_RING_SLOTS].get() };
+        // The consumer finishes `f` before the read index advances.
+        let out = unsafe { f(&*self.slots[r % WIFI_RING_SLOTS].get()) };
         self.read.store(r.wrapping_add(1), Ordering::Release);
-        Some(slot)
+        Some(out)
+    }
+
+    pub fn try_pop(&self) -> Option<WifiSlot> {
+        self.with_next(|slot| {
+            let n = usize::from(slot.len).min(WIFI_SNAP_LEN);
+            let mut out = WifiSlot {
+                hdr: slot.hdr,
+                len: n as u16,
+                payload: [0; WIFI_SNAP_LEN],
+            };
+            out.payload[..n].copy_from_slice(&slot.payload[..n]);
+            out
+        })
     }
 }
 
@@ -133,8 +152,26 @@ mod tests {
 
     #[test]
     fn empty_pop_is_none() {
-        assert!(WifiRing::new().try_pop().is_none());
+        let ring = WifiRing::new();
+        assert!(ring.is_empty());
+        assert!(ring.try_pop().is_none());
+        assert!(ring.with_next(|_| ()).is_none());
         assert!(WifiRing::default().try_pop().is_none());
+    }
+
+    #[test]
+    fn with_next_sees_bytes_then_slot_is_gone() {
+        let ring = WifiRing::new();
+        assert!(matches!(
+            ring.try_push(hdr(1), &[9, 8, 7], 3),
+            PushOutcome::Stored { truncated: false }
+        ));
+        assert!(!ring.is_empty());
+        assert_eq!(
+            ring.with_next(|s| s.payload().to_vec()).unwrap(),
+            vec![9, 8, 7]
+        );
+        assert!(ring.is_empty());
     }
 
     #[test]
