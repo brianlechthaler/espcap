@@ -26,4 +26,4 @@ make flash-s3
 make flash-c5
 ```
 
-Requires the shared ESP32 toolkit at `~/.esp32-dev`. Host commands use `/dev/ttyACM*` (USB Serial/JTAG). `make flash-c5` writes `/dev/ttyACM1` by default (`C5_PORT` overrides it). Confirm that port is an ESP32-C5 before flashing; on this bench the S3 is `/dev/ttyACM0`.
+Requires the shared ESP32 toolkit at `~/.esp32-dev`. `make flash-s3` and `make flash-c5` probe USB serial ports and flash the matching chip. `S3_PORT` and `C5_PORT` override that. `make devices` prints each port and chip. Host commands still take `--port` (see [Getting started](docs/getting-started.md)).
