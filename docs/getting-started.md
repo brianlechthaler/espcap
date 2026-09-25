@@ -6,10 +6,17 @@ Promiscuous capture of other people's traffic may be restricted. Use this only o
 
 | Board | USB serial | WiFi |
 |-------|------------|------|
-| ESP32-S3 | `/dev/ttyACM0` (USB Serial/JTAG) | 2.4 GHz |
-| ESP32-C5 | `/dev/ttyACM1` (USB Serial/JTAG) | 2.4 GHz and 5 GHz |
+| ESP32-S3 | USB Serial/JTAG (`/dev/ttyACM*` or `/dev/ttyUSB*`) | 2.4 GHz |
+| ESP32-C5 | USB Serial/JTAG (`/dev/ttyACM*` or `/dev/ttyUSB*`) | 2.4 GHz and 5 GHz |
 
-`make flash-s3` writes the S3 on `/dev/ttyACM0`. `make flash-c5` writes the C5 (`C5_PORT`, default `/dev/ttyACM1`). Confirm the port with `esptool chip-id` before flashing so the two boards are not swapped.
+`make flash-s3` and `make flash-c5` probe each of those nodes with esptool, read the chip type, and flash the one that matches. Probing resets every Espressif port it opens, then lets the application boot again. If the chip is missing, or `S3_PORT` / `C5_PORT` points at a different chip, make stops before flashing. If several boards of the same chip are attached, set `S3_PORT` or `C5_PORT`. `make devices` lists `port` and chip without flashing.
+
+```bash
+make devices
+make flash-s3
+make flash-c5
+C5_PORT=/dev/ttyACM1 make flash-c5
+```
 
 ## Host tools
 
@@ -34,7 +41,7 @@ make flash-s3
 make flash-c5
 ```
 
-`flash-s3` writes USB Serial/JTAG on `/dev/ttyACM0`. After reset, the device speaks JSON lines at 115200 8N1. `espcap` deasserts RTS then DTR so Linux CDC-ACM does not reset the S3, then waits for a `status` event (up to 15s) before sending commands.
+After reset, the device speaks JSON lines at 115200 8N1. `espcap` deasserts RTS then DTR so Linux CDC-ACM does not reset the S3, then waits for a `status` event (up to 15s) before sending commands.
 
 ## First capture
 

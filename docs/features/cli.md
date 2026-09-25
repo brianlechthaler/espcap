@@ -4,7 +4,7 @@
 
 ## Overview
 
-`--port` is required. Default baud is 115200. Typical device nodes are `/dev/ttyACM0` (ESP32-S3 on this bench) and `/dev/ttyACM1` (ESP32-C5).
+`--port` is required. Default baud is 115200. `make devices` prints each USB serial node and its chip (`ESP32-S3` or `ESP32-C5`). Pass that node as `--port`.
 
 On open the CLI clears RTS, then DTR, and clears `HUPCL`, so ESP32 USB-JTAG does not reset (`RTS=1` and `DTR=0` is a chip reset). It then waits up to 15 seconds for a `status` line before sending the command.
 
