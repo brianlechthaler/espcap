@@ -39,16 +39,29 @@ fn parse_octets<const N: usize>(s: &str) -> Result<[u8; N], Error> {
     Ok(out)
 }
 
+fn push_hex(out: &mut String, b: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(HEX[(b >> 4) as usize] as char);
+    out.push(HEX[(b & 0xf) as usize] as char);
+}
+
 fn format_octets(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(":")
+    let mut out = String::with_capacity(bytes.len().saturating_mul(3).saturating_sub(1));
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 {
+            out.push(':');
+        }
+        push_hex(&mut out, b);
+    }
+    out
 }
 
 pub fn payload_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        push_hex(&mut out, b);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -73,6 +86,8 @@ mod tests {
         assert!(parse_mac("zz:zz:zz:zz:zz:zz").is_err());
         assert!(parse_oui("gggggg").is_err());
         assert_eq!(payload_hex(&[0xde, 0xad]), "dead");
+        assert_eq!(payload_hex(&[]), "");
+        assert_eq!(format_mac(&[0, 0, 0, 0, 0, 0]), "00:00:00:00:00:00");
         assert_eq!(visible_text("A\u{1b}\nB\u{FFFD}"), "AB");
     }
 }

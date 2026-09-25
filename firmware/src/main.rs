@@ -95,11 +95,9 @@ fn now_ms() -> u64 {
     unsafe { esp_timer_get_time() as u64 / 1000 }
 }
 
-fn emit(line: &str) {
-    let mut buf = Vec::with_capacity(line.len() + 1);
-    buf.extend_from_slice(line.as_bytes());
-    buf.push(b'\n');
-    emit_bytes(&buf);
+fn emit(mut line: String) {
+    line.push('\n');
+    emit_bytes(line.as_bytes());
 }
 
 fn emit_bytes(bytes: &[u8]) {
@@ -162,7 +160,7 @@ fn reply_status(cfg: &DeviceConfig) {
         truncated: DROP_TRUNC.load(Ordering::Relaxed),
     };
     if let Ok(s) = serde_json::to_string(&cfg.status_json(chip(), &drops)) {
-        emit(&s);
+        emit(s);
     }
 }
 
@@ -219,7 +217,7 @@ fn apply_command(cfg: &mut DeviceConfig, line: &str) -> bool {
         }
         Ok(Command::Start) => {
             cfg.running = true;
-            emit(&encode_event(&ack()).unwrap_or_else(|_| "{\"event\":\"ack\"}".into()));
+            emit(encode_event(&ack()).unwrap_or_else(|_| "{\"event\":\"ack\"}".into()));
             if cfg.format == OutputFormat::Pcap {
                 if matches!(cfg.radio, Radio::Wifi | Radio::Both) {
                     if let Ok(frame) = encode_frame(
@@ -241,7 +239,7 @@ fn apply_command(cfg: &mut DeviceConfig, line: &str) -> bool {
         }
         Ok(Command::Stop) => {
             cfg.running = false;
-            emit(&encode_event(&ack()).unwrap_or_else(|_| "{\"event\":\"ack\"}".into()));
+            emit(encode_event(&ack()).unwrap_or_else(|_| "{\"event\":\"ack\"}".into()));
             true
         }
         Ok(Command::Set {
@@ -274,35 +272,27 @@ fn apply_command(cfg: &mut DeviceConfig, line: &str) -> bool {
             ) {
                 Ok(()) => match cfg.validate_for_chip(chip()) {
                     Ok(()) => {
-                        emit(
-                            &encode_event(&ack()).unwrap_or_else(|_| "{\"event\":\"ack\"}".into()),
-                        );
+                        emit(encode_event(&ack()).unwrap_or_else(|_| "{\"event\":\"ack\"}".into()));
                         true
                     }
                     Err(e) => {
-                        emit(
-                            &encode_event(&error_event(e.to_string())).unwrap_or_else(|_| {
-                                "{\"event\":\"error\",\"msg\":\"encode\"}".into()
-                            }),
-                        );
+                        emit(encode_event(&error_event(e.to_string())).unwrap_or_else(|_| {
+                            "{\"event\":\"error\",\"msg\":\"encode\"}".into()
+                        }));
                         false
                     }
                 },
                 Err(e) => {
-                    emit(
-                        &encode_event(&error_event(e.to_string()))
-                            .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()),
-                    );
+                    emit(encode_event(&error_event(e.to_string()))
+                        .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()));
                     false
                 }
             }
         }
         Err(espcap_protocol::Error::UnknownCommand) => false,
         Err(e) => {
-            emit(
-                &encode_event(&error_event(e.to_string()))
-                    .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()),
-            );
+            emit(encode_event(&error_event(e.to_string()))
+                .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()));
             false
         }
     }
@@ -336,7 +326,7 @@ fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut MacLru<Dedup>, pkt: &WifiSlot
                 pkt.hdr.ts_ms,
                 pkt.payload(),
             )) {
-                emit(&s);
+                emit(s);
             }
         } else {
             if let Ok(frame) = encode_frame(
@@ -407,7 +397,7 @@ fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut MacLru<Dedup>, pkt: &WifiSlot
         };
         if cfg.format == OutputFormat::Json {
             if let Ok(s) = encode_event(&ev) {
-                emit(&s);
+                emit(s);
             }
         }
     }
@@ -429,7 +419,7 @@ fn maybe_emit_ble(cfg: &DeviceConfig, dedup: &mut MacLru<Dedup>, pkt: &BlePkt) {
                 &pkt.adv,
                 pkt.name.as_deref(),
             )) {
-                emit(&s);
+                emit(s);
             }
         } else {
             if let Ok(frame) = encode_frame(
@@ -472,7 +462,7 @@ fn maybe_emit_ble(cfg: &DeviceConfig, dedup: &mut MacLru<Dedup>, pkt: &BlePkt) {
         e.last,
         pkt.addr_random,
     )) {
-        emit(&s);
+        emit(s);
     }
 }
 
@@ -537,6 +527,21 @@ fn main() -> Result<(), EspError> {
 
     // std::thread ignores esp_pthread_set_cfg stack size and keeps the 8KB
     // pthread default. Wi-Fi start needs more than the 16KB main task.
+    // Encode stays on core 1 so the Wi-Fi callback on core 0 is not preempted.
+    #[cfg(target_arch = "xtensa")]
+    {
+        use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
+        ThreadSpawnConfiguration {
+            name: Some(c"app"),
+            stack_size: 24 * 1024,
+            priority: 5,
+            inherit: false,
+            pin_to_core: Some(esp_idf_svc::hal::cpu::Core::Core1),
+            ..Default::default()
+        }
+        .set()
+        .ok();
+    }
     thread::Builder::new()
         .name("app".into())
         .stack_size(24 * 1024)
@@ -654,13 +659,14 @@ fn run_loop(
         let snap = cfg.lock().unwrap().clone();
         if snap.running && matches!(snap.radio, Radio::Wifi | Radio::Both) {
             for _ in 0..WIFI_RING_SLOTS {
-                let Some(pkt) = WIFI_RING.try_pop() else {
+                let Some(()) = WIFI_RING.with_next(|pkt| {
+                    maybe_emit_wifi(&snap, &mut wifi_dedup, pkt);
+                }) else {
                     break;
                 };
-                maybe_emit_wifi(&snap, &mut wifi_dedup, &pkt);
             }
         } else {
-            while WIFI_RING.try_pop().is_some() {}
+            while WIFI_RING.with_next(|_| ()).is_some() {}
         }
         for _ in 0..8 {
             let Ok(pkt) = ble_rx.try_recv() else {
@@ -673,7 +679,13 @@ fn run_loop(
         unsafe {
             let _ = esp_task_wdt_reset();
         }
-        FreeRtos::delay_ms(10);
+        // Idle 10 ms only when the ring is drained. A 1 ms yield while frames
+        // remain lets the idle task run without holding a 32-slot burst.
+        if WIFI_RING.is_empty() {
+            FreeRtos::delay_ms(10);
+        } else {
+            FreeRtos::delay_ms(1);
+        }
     }
 }
 
