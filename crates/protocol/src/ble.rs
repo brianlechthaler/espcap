@@ -37,6 +37,24 @@ pub fn parse_adv(data: &[u8]) -> AdvFields {
     fields
 }
 
+/// NimBLE scan interval and window are in 0.625 ms units, spec range 4..=0x4000.
+pub fn scan_units(ms: u16) -> u16 {
+    let units = u32::from(ms) * 8 / 5;
+    units.clamp(4, 0x4000) as u16
+}
+
+/// Scan window in NimBLE units, never longer than the interval.
+pub fn scan_window(interval_ms: u16, window_ms: u16) -> u16 {
+    scan_units(window_ms).min(scan_units(interval_ms))
+}
+
+/// Controller addresses are little-endian. Display order is the reverse.
+pub fn display_addr(controller: [u8; 6]) -> [u8; 6] {
+    let mut addr = controller;
+    addr.reverse();
+    addr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,5 +88,31 @@ mod tests {
         let data = [0x02, 0x01, 0x06, 0x02, 0xff, 0x4c];
         let f = parse_adv(&data);
         assert_eq!(f, AdvFields::default());
+    }
+
+    #[test]
+    fn scan_units_scale_and_clamp() {
+        assert_eq!(scan_units(100), 160);
+        assert_eq!(scan_units(30), 48);
+        assert_eq!(scan_units(0), 4);
+        assert_eq!(scan_units(2), 4);
+        assert_eq!(scan_units(10_240), 0x4000);
+        assert_eq!(scan_units(u16::MAX), 0x4000);
+    }
+
+    #[test]
+    fn scan_window_does_not_exceed_interval() {
+        assert_eq!(scan_window(100, 30), 48);
+        assert_eq!(scan_window(30, 100), scan_units(30));
+    }
+
+    #[test]
+    fn controller_addr_reverses_for_display() {
+        assert_eq!(
+            display_addr([0x06, 0x05, 0x04, 0x03, 0x02, 0x01]),
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x06]
+        );
+        let shown = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        assert_eq!(display_addr(display_addr(shown)), shown);
     }
 }

@@ -13,6 +13,6 @@ flowchart LR
 
 WiFi RX copies into the ring and returns. A later task parses, filters, dedups discovery, and writes the serial port. Config (including `running`) is stored in NVS under namespace `espcap`.
 
-The BLE encode path is in the same task. This build does not start a NimBLE scan, so that path receives no packets. See [BLE](features/ble.md).
+The BLE encode path is in the same task. NimBLE extended discovery enqueues advertisements on that path. See [BLE](features/ble.md).
 
 Chip limits and the original core map are in [plan/architecture.md](plan/architecture.md).
