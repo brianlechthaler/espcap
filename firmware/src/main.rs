@@ -3,12 +3,17 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_svc::sys::{
-    esp_task_wdt_reset, esp_timer_get_time, esp_wifi_set_band_mode, esp_wifi_set_channel,
-    esp_wifi_set_promiscuous, esp_wifi_set_promiscuous_filter, esp_wifi_set_promiscuous_rx_cb,
+    ble_gap_disc, ble_gap_disc_active, ble_gap_disc_cancel, ble_gap_disc_params, ble_gap_event,
+    ble_gap_ext_disc, ble_gap_ext_disc_params, ble_hs_cfg, ble_hs_id_infer_auto,
+    ble_store_util_status_rr, esp_task_wdt_reset, esp_timer_get_time, esp_wifi_set_band_mode,
+    esp_wifi_set_channel, esp_wifi_set_promiscuous, esp_wifi_set_promiscuous_filter,
+    esp_wifi_set_promiscuous_rx_cb, nimble_port_freertos_init, nimble_port_init, nimble_port_run,
     wifi_promiscuous_filter_t, wifi_promiscuous_pkt_t, wifi_promiscuous_pkt_type_t_WIFI_PKT_MISC,
-    wifi_second_chan_t_WIFI_SECOND_CHAN_NONE, EspError,
+    wifi_second_chan_t_WIFI_SECOND_CHAN_NONE, EspError, BLE_GAP_EVENT_DISC,
+    BLE_GAP_EVENT_DISC_COMPLETE, BLE_GAP_EVENT_EXT_DISC, BLE_HS_EALREADY, ESP_OK,
 };
 use esp_idf_svc::wifi::{ClientConfiguration, Configuration, EspWifi};
+use espcap_protocol::ble::{display_addr, parse_adv, scan_units, scan_window};
 use espcap_protocol::config::DropCounters;
 use espcap_protocol::pcap::{
     ble_pcap_payload, encode_frame, pcap_global_header, wifi_pcap_payload,
@@ -21,21 +26,18 @@ use espcap_protocol::{
     wifi_frame, wifi_sta, Command, DeviceConfig, MacLru, PushOutcome, WifiHdr, WifiRing, WifiSlot,
     DEDUP_CAP, WIFI_RING_SLOTS,
 };
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 const DEDUP_COOLDOWN_MS: u64 = 5000;
 
-#[derive(Clone)]
 struct BlePkt {
     addr: [u8; 6],
     addr_random: bool,
     rssi: i8,
     ts_ms: u64,
-    name: Option<String>,
-    company_id: Option<u16>,
     adv: Vec<u8>,
 }
 
@@ -49,6 +51,13 @@ struct Dedup {
 
 static WIFI_RING: WifiRing = WifiRing::new();
 static WIFI_ON: AtomicBool = AtomicBool::new(false);
+static BLE_TX: OnceLock<SyncSender<BlePkt>> = OnceLock::new();
+static BLE_READY: AtomicBool = AtomicBool::new(false);
+static BLE_WANT: AtomicBool = AtomicBool::new(false);
+static BLE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static BLE_ITVL: AtomicU16 = AtomicU16::new(100);
+static BLE_WIN: AtomicU16 = AtomicU16::new(30);
+static BLE_KEY: AtomicU32 = AtomicU32::new(u32::MAX);
 static DROP_RING: AtomicU32 = AtomicU32::new(0);
 static DROP_CDC: AtomicU32 = AtomicU32::new(0);
 static DROP_TRUNC: AtomicU32 = AtomicU32::new(0);
@@ -220,17 +229,17 @@ fn apply_command(cfg: &mut DeviceConfig, line: &str) -> bool {
             emit(encode_event(&ack()).unwrap_or_else(|_| "{\"event\":\"ack\"}".into()));
             if cfg.format == OutputFormat::Pcap {
                 if matches!(cfg.radio, Radio::Wifi | Radio::Both) {
-                    if let Ok(frame) = encode_frame(
-                        TYPE_GLOBAL,
-                        &pcap_global_header(DLT_IEEE802_11_RADIO),
-                    ) {
+                    if let Ok(frame) =
+                        encode_frame(TYPE_GLOBAL, &pcap_global_header(DLT_IEEE802_11_RADIO))
+                    {
                         emit_bytes(&frame);
                     }
                 }
                 if matches!(cfg.radio, Radio::Ble | Radio::Both) {
-                    if let Ok(frame) =
-                        encode_frame(TYPE_GLOBAL, &pcap_global_header(DLT_BLUETOOTH_LE_LL_WITH_PHDR))
-                    {
+                    if let Ok(frame) = encode_frame(
+                        TYPE_GLOBAL,
+                        &pcap_global_header(DLT_BLUETOOTH_LE_LL_WITH_PHDR),
+                    ) {
                         emit_bytes(&frame);
                     }
                 }
@@ -276,23 +285,29 @@ fn apply_command(cfg: &mut DeviceConfig, line: &str) -> bool {
                         true
                     }
                     Err(e) => {
-                        emit(encode_event(&error_event(e.to_string())).unwrap_or_else(|_| {
-                            "{\"event\":\"error\",\"msg\":\"encode\"}".into()
-                        }));
+                        emit(
+                            encode_event(&error_event(e.to_string())).unwrap_or_else(|_| {
+                                "{\"event\":\"error\",\"msg\":\"encode\"}".into()
+                            }),
+                        );
                         false
                     }
                 },
                 Err(e) => {
-                    emit(encode_event(&error_event(e.to_string()))
-                        .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()));
+                    emit(
+                        encode_event(&error_event(e.to_string()))
+                            .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()),
+                    );
                     false
                 }
             }
         }
         Err(espcap_protocol::Error::UnknownCommand) => false,
         Err(e) => {
-            emit(encode_event(&error_event(e.to_string()))
-                .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()));
+            emit(
+                encode_event(&error_event(e.to_string()))
+                    .unwrap_or_else(|_| "{\"event\":\"error\",\"msg\":\"encode\"}".into()),
+            );
             false
         }
     }
@@ -404,9 +419,10 @@ fn maybe_emit_wifi(cfg: &DeviceConfig, dedup: &mut MacLru<Dedup>, pkt: &WifiSlot
 }
 
 fn maybe_emit_ble(cfg: &DeviceConfig, dedup: &mut MacLru<Dedup>, pkt: &BlePkt) {
+    let fields = parse_adv(&pkt.adv);
     if !cfg
         .filters
-        .matches_ble(&pkt.addr, pkt.name.as_deref(), pkt.company_id)
+        .matches_ble(&pkt.addr, fields.name.as_deref(), fields.company_id)
     {
         return;
     }
@@ -417,21 +433,15 @@ fn maybe_emit_ble(cfg: &DeviceConfig, dedup: &mut MacLru<Dedup>, pkt: &BlePkt) {
                 pkt.rssi,
                 pkt.ts_ms,
                 &pkt.adv,
-                pkt.name.as_deref(),
+                fields.name.as_deref(),
             )) {
                 emit(s);
             }
         } else {
+            let wire = display_addr(pkt.addr);
             if let Ok(frame) = encode_frame(
                 TYPE_BLE,
-                &ble_pcap_payload(
-                    pkt.ts_ms,
-                    pkt.rssi,
-                    39,
-                    &pkt.addr,
-                    pkt.addr_random,
-                    &pkt.adv,
-                ),
+                &ble_pcap_payload(pkt.ts_ms, pkt.rssi, 39, &wire, pkt.addr_random, &pkt.adv),
             ) {
                 emit_bytes(&frame);
             }
@@ -455,8 +465,8 @@ fn maybe_emit_ble(cfg: &DeviceConfig, dedup: &mut MacLru<Dedup>, pkt: &BlePkt) {
         &pkt.addr,
         pkt.rssi,
         pkt.ts_ms,
-        pkt.name.as_deref(),
-        pkt.company_id,
+        fields.name.as_deref(),
+        fields.company_id,
         e.hits,
         e.first,
         e.last,
@@ -489,9 +499,11 @@ fn apply_radios(cfg: &DeviceConfig) {
     unsafe {
         let _ = esp_wifi_set_promiscuous(wifi);
     }
-    if ble {
-        log::warn!("BLE requested; NimBLE host FFI is unavailable in this build");
-    }
+    BLE_WANT.store(ble, Ordering::Relaxed);
+    BLE_ITVL.store(cfg.ble_interval_ms, Ordering::Relaxed);
+    BLE_WIN.store(cfg.ble_window_ms, Ordering::Relaxed);
+    BLE_ACTIVE.store(cfg.ble_active, Ordering::Relaxed);
+    ensure_scan();
 }
 
 fn hop_loop(running: Arc<AtomicBool>, cfg: Arc<Mutex<DeviceConfig>>) {
@@ -690,5 +702,156 @@ fn run_loop(
 }
 
 fn spawn_ble(tx: SyncSender<BlePkt>) {
-    std::mem::forget(tx);
+    let _ = BLE_TX.set(tx);
+    let rc = unsafe { nimble_port_init() };
+    if rc != ESP_OK {
+        log::error!("nimble_port_init: {rc}");
+        return;
+    }
+    unsafe {
+        ble_hs_cfg.sync_cb = Some(ble_on_sync);
+        ble_hs_cfg.store_status_cb = Some(ble_store_util_status_rr);
+        nimble_port_freertos_init(Some(ble_host_task));
+    }
+}
+
+unsafe extern "C" fn ble_host_task(_: *mut core::ffi::c_void) {
+    unsafe { nimble_port_run() };
+}
+
+unsafe extern "C" fn ble_on_sync() {
+    BLE_READY.store(true, Ordering::Relaxed);
+    ensure_scan();
+}
+
+fn scan_key() -> u32 {
+    let itvl = u32::from(scan_units(BLE_ITVL.load(Ordering::Relaxed)));
+    let window = u32::from(scan_window(
+        BLE_ITVL.load(Ordering::Relaxed),
+        BLE_WIN.load(Ordering::Relaxed),
+    ));
+    let active = u32::from(BLE_ACTIVE.load(Ordering::Relaxed));
+    (itvl << 16) | (window << 1) | active
+}
+
+fn ensure_scan() {
+    if !BLE_READY.load(Ordering::Relaxed) {
+        return;
+    }
+    let active = unsafe { ble_gap_disc_active() } != 0;
+    if !BLE_WANT.load(Ordering::Relaxed) {
+        if active {
+            unsafe { ble_gap_disc_cancel() };
+        }
+        BLE_KEY.store(u32::MAX, Ordering::Relaxed);
+        return;
+    }
+    let key = scan_key();
+    if active {
+        if BLE_KEY.load(Ordering::Relaxed) != key {
+            unsafe { ble_gap_disc_cancel() };
+        }
+        return;
+    }
+    start_disc(key);
+}
+
+fn start_disc(key: u32) {
+    let mut own = 0u8;
+    let rc = unsafe { ble_hs_id_infer_auto(0, &mut own) };
+    if rc != 0 {
+        log::error!("ble addr: {rc}");
+        return;
+    }
+    let itvl = scan_units(BLE_ITVL.load(Ordering::Relaxed));
+    let window = scan_window(
+        BLE_ITVL.load(Ordering::Relaxed),
+        BLE_WIN.load(Ordering::Relaxed),
+    );
+    let passive = u8::from(!BLE_ACTIVE.load(Ordering::Relaxed));
+    let mut params = ble_gap_ext_disc_params::default();
+    params.itvl = itvl;
+    params.window = window;
+    params.set_passive(passive);
+    let rc = unsafe {
+        ble_gap_ext_disc(
+            own,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &params,
+            &params,
+            Some(ble_gap_cb),
+            core::ptr::null_mut(),
+        )
+    };
+    if rc == 0 || rc == BLE_HS_EALREADY as i32 {
+        BLE_KEY.store(key, Ordering::Relaxed);
+        return;
+    }
+    log::warn!("ble_gap_ext_disc: {rc}");
+    let mut legacy = ble_gap_disc_params::default();
+    legacy.itvl = itvl;
+    legacy.window = window;
+    legacy.set_passive(passive);
+    let rc = unsafe {
+        ble_gap_disc(
+            own,
+            i32::MAX,
+            &legacy,
+            Some(ble_gap_cb),
+            core::ptr::null_mut(),
+        )
+    };
+    if rc == 0 || rc == BLE_HS_EALREADY as i32 {
+        BLE_KEY.store(key, Ordering::Relaxed);
+    } else {
+        log::error!("ble_gap_disc: {rc}");
+    }
+}
+
+unsafe extern "C" fn ble_gap_cb(
+    event: *mut ble_gap_event,
+    _: *mut core::ffi::c_void,
+) -> core::ffi::c_int {
+    if event.is_null() {
+        return 0;
+    }
+    let event = unsafe { &*event };
+    match event.type_ as u32 {
+        BLE_GAP_EVENT_EXT_DISC => {
+            let disc = unsafe { event.__bindgen_anon_1.ext_disc };
+            enqueue_adv(disc.addr, disc.rssi, disc.data, disc.length_data);
+        }
+        BLE_GAP_EVENT_DISC => {
+            let disc = unsafe { event.__bindgen_anon_1.disc };
+            enqueue_adv(disc.addr, disc.rssi, disc.data, disc.length_data);
+        }
+        BLE_GAP_EVENT_DISC_COMPLETE => ensure_scan(),
+        _ => {}
+    }
+    0
+}
+
+fn enqueue_adv(addr: esp_idf_svc::sys::ble_addr_t, rssi: i8, data: *const u8, len: u8) {
+    let Some(tx) = BLE_TX.get() else {
+        return;
+    };
+    let adv = if data.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        unsafe { core::slice::from_raw_parts(data, usize::from(len)) }.to_vec()
+    };
+    let pkt = BlePkt {
+        addr: display_addr(addr.val),
+        addr_random: addr.type_ != 0,
+        rssi,
+        ts_ms: now_ms(),
+        adv,
+    };
+    if tx.try_send(pkt).is_err() {
+        DROP_RING.fetch_add(1, Ordering::Relaxed);
+    }
 }

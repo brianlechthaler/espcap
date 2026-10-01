@@ -1,12 +1,10 @@
 # BLE advertisements
 
-Passive advertising scan. Discovery would emit deduplicated `ble` JSON. Capture would emit `ble_adv` JSON or DLT 256 PCAP rebuilt from the advertising PDU.
+Passive advertising scan. Discovery emits deduplicated `ble` JSON. Capture emits `ble_adv` JSON or DLT 256 PCAP rebuilt from the advertising PDU.
 
 ## Overview
 
-No Classic BR/EDR and no connections. The host and the on-wire protocol accept BLE settings. This firmware build does not start NimBLE: `spawn_ble` drops the packet channel, and `apply_radios` logs that the NimBLE host is unavailable. `radio` `ble` or `both` is stored and returned by `status`, but no `ble` or `ble_adv` lines are produced.
-
-The event path that exists in the protocol crate is described below so a later scan task can match it.
+No Classic BR/EDR and no connections. `spawn_ble` starts the NimBLE host. While `running` is set and `radio` is `ble` or `both`, the firmware runs an extended discovery procedure and enqueues advertisements. Discovery emits deduplicated `ble` lines. Capture emits `ble_adv` JSON or DLT 256 PCAP.
 
 Scan interval and window come from `set --ble-interval-ms` and `--ble-window-ms` (defaults 100 ms and 30 ms). `--ble-active true` is the flag for active scan requests. The default is passive (`false`).
 
@@ -18,15 +16,15 @@ Capture is not deduped. PCAP uses DLT 256 (`BLUETOOTH_LE_LL_WITH_PHDR`): 10-byte
 
 ## Usage
 
-Settings are accepted and saved in NVS. They do not start a scan on this build:
+Settings are saved in NVS. A scan runs only after `start` (or `set` while already running) with `radio` `ble` or `both`:
 
 ```bash
 espcap --port /dev/ttyACM0 set --radio ble --mode discovery --format json \
   --ble-interval-ms 100 --ble-window-ms 30 --ble-active false
-espcap --port /dev/ttyACM0 status
+espcap --port /dev/ttyACM0 start
 ```
 
-A discovery line, once a scan task exists, looks like:
+A discovery line looks like:
 
 ```json
 {"event":"ble","mac":"aa:bb:cc:dd:ee:ff","oui":"AA:BB:CC","rssi":-60,"channel":39,"freq_mhz":2480,"ts_ms":12,"name":"AirPods","company_id":76,"hit_count":1,"first_ts_ms":12,"last_ts_ms":12,"addr_type":"random"}
@@ -51,8 +49,8 @@ Empty filters pass every advertisement that a scan task enqueues.
 
 | Symptom | Cause |
 |---------|--------|
-| `status` shows `radio` `ble` and no advertisements | Expected on this build. NimBLE is not started. |
-| `capture-ble.pcap` is only a global header | The CLI always creates the BLE file. No scan means no records. |
+| `status` shows `radio` `ble` and no advertisements | Scan is stopped (`running` false), or no advertisers are in range. |
+| `capture-ble.pcap` is only a global header | The CLI always creates the BLE file. An idle scan writes no records. |
 
 ## Related
 
