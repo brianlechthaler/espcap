@@ -24,6 +24,8 @@ pub struct ParsedWifi {
     pub addr2: [u8; 6],
     pub addr3: Option<[u8; 6]>,
     pub ssid: Option<String>,
+    /// UAS ID from a Remote ID Beacon vendor element or NAN frame.
+    pub remote_id: Option<String>,
     /// AP first, then up to two stations (probe-response receiver, data SA/DA).
     pub discovery: [Option<Discovery>; 3],
 }
@@ -82,6 +84,10 @@ pub fn parse_80211(mpdu: &[u8]) -> Result<ParsedWifi, Error> {
     } else {
         None
     };
+    let remote_id = remoteid::wifi::parse_frame(mpdu)
+        .ok()
+        .and_then(|rid| rid.frame().ok())
+        .and_then(crate::ble::uas_id);
     let mut discovery = [None, None, None];
     match (kind, subtype) {
         (FrameKind::Mgmt, SUBTYPE_BEACON | SUBTYPE_PROBE_RESP) => {
@@ -114,6 +120,7 @@ pub fn parse_80211(mpdu: &[u8]) -> Result<ParsedWifi, Error> {
         addr2,
         addr3,
         ssid,
+        remote_id,
         discovery,
     })
 }
@@ -212,6 +219,24 @@ fn mgmt_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn beacon_remote_id_vendor_element() {
+        let mut msg = vec![0x02, 0x12];
+        msg.extend_from_slice(b"1596F3507452");
+        msg.resize(25, 0);
+        let mut ie = vec![0xdd, 0, 0xfa, 0x0b, 0xbc, 0x0d, 0x01, 0xf2, 25, 1];
+        ie.extend_from_slice(&msg);
+        ie[1] = (ie.len() - 2) as u8;
+        let mut beacon = beacon_fixture([0x60, 0x60, 0x1f, 1, 2, 3], "");
+        beacon.extend_from_slice(&ie);
+        let p = parse_80211(&beacon).unwrap();
+        assert_eq!(p.remote_id.as_deref(), Some("1596F3507452"));
+        assert_eq!(
+            parse_80211(&beacon_fixture([1; 6], "x")).unwrap().remote_id,
+            None
+        );
+    }
 
     #[test]
     fn parse_beacon_probe_data_ctrl() {

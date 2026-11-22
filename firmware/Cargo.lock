@@ -620,6 +620,7 @@ name = "espcap-protocol"
 version = "0.1.0"
 dependencies = [
  "regex-lite",
+ "remoteid",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -1109,6 +1110,12 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "remoteid"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "212a4b231e5b2a71fd5c1fb52a103d2ec345d1e55676a4508c866505b71a4807"
 
 [[package]]
 name = "remove_dir_all"

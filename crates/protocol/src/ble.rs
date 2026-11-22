@@ -5,6 +5,8 @@ use crate::mac::visible_text;
 pub struct AdvFields {
     pub name: Option<String>,
     pub company_id: Option<u16>,
+    /// UAS ID from an ASTM F3411 Remote ID Basic ID message (service data 0xFFFA).
+    pub remote_id: Option<String>,
 }
 
 /// Walk BLE AD structure (length, type, value) and pick name / company id.
@@ -34,7 +36,22 @@ pub fn parse_adv(data: &[u8]) -> AdvFields {
         }
         i += 1 + elen;
     }
+    fields.remote_id = remoteid::ble::find_in_advertising_data(data)
+        .and_then(|rid| rid.frame().ok())
+        .and_then(uas_id);
     fields
+}
+
+/// First Basic ID UAS ID in a decoded Remote ID message or message pack.
+pub fn uas_id(frame: remoteid::Frame<'_>) -> Option<String> {
+    let id = |m: remoteid::Message| match m {
+        remoteid::Message::BasicId(b) => b.uas_id_str().map(str::to_string),
+        _ => None,
+    };
+    match frame {
+        remoteid::Frame::Message(m) => id(m),
+        remoteid::Frame::Pack(p) => p.messages().filter_map(Result::ok).find_map(id),
+    }
 }
 
 /// NimBLE scan interval and window are in 0.625 ms units, spec range 4..=0x4000.
@@ -88,6 +105,16 @@ mod tests {
         let data = [0x02, 0x01, 0x06, 0x02, 0xff, 0x4c];
         let f = parse_adv(&data);
         assert_eq!(f, AdvFields::default());
+    }
+
+    #[test]
+    fn drone_remote_id_service_data() {
+        let mut data = vec![0x1e, 0x16, 0xfa, 0xff, 0x0d, 0x07, 0x02, 0x12];
+        data.extend_from_slice(b"1596F3507452");
+        data.resize(31, 0);
+        let f = parse_adv(&data);
+        assert_eq!(f.remote_id.as_deref(), Some("1596F3507452"));
+        assert_eq!(f.name, None);
     }
 
     #[test]
